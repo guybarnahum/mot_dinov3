@@ -42,6 +42,8 @@ def parse_args():
     ap.add_argument("--crop-pad", type=float, default=0.12, help="Padding ratio around det box for embeddings")
     ap.add_argument("--crop-square", action="store_true", default=True, help="Use square crops for embeddings (default on)")
 
+    ap.add_argument("--embed-amp", choices=["auto","fp16","bf16","off"], default="auto",
+                    help="Autocast dtype for embeddings: 'auto' chooses bf16 on Ampere+, fp16 on older GPUs.")
     ap.add_argument("--embed-refresh", type=int, default=5, help="Refresh real embedding every N frames")
     ap.add_argument("--embed-iou-gate", type=float, default=0.6, help="IoU ≥ gate → treat as stable candidate")
     ap.add_argument("--embed-overlap-thr", type=float, default=0.2, help="Det-det IoU > thr marks crowded")
@@ -70,12 +72,15 @@ def compute_embeddings(frame: np.ndarray,
     """
     Budgeted embedding computation.
     - Always computes 'critical' embeddings (new/crowded/weak IoU).
-    - 'Refresh' embeddings are computed only within the remaining budget.
+    - 'Refresh' embeddings are computed incrementally, honoring budget_ms strictly.
     Returns:
       embs           : (N,D) float32
       t_emb_seconds  : total seconds spent in this step
       refreshed_tids : set of tids whose embedding was (re)computed this frame
     """
+    on_cuda = (getattr(embedder, "device", "cpu") == "cuda")
+    if on_cuda:
+        torch.cuda.synchronize()  # start with a clean slate for timing
     t0 = perf_counter()
 
     N = len(boxes)
@@ -96,13 +101,15 @@ def compute_embeddings(frame: np.ndarray,
                 embs[j] = tid2emb[tid]
                 scheduler.stat_reuse += 1
 
-    # --- 1) Critical set (must compute now)
+    # --- 1) Critical set (must compute now; not budgeted) ---
     idx_crit = np.nonzero(need_mask & ~due_mask)[0]
     if len(idx_crit) > 0:
         t1 = perf_counter()
         embs_crit = embedder.embed_crops(frame, boxes[idx_crit])
-        embs[idx_crit] = embs_crit
+        if on_cuda:
+            torch.cuda.synchronize()
         batch_ms = (perf_counter() - t1) * 1000.0
+        embs[idx_crit] = embs_crit
         scheduler.update_ema_ms_per_crop(batch_ms, len(idx_crit))
         scheduler.stat_real += len(idx_crit)
         refreshed_tids |= scheduler.mark_refreshed(active_snapshot, boxes, idx_crit, frame_idx)
@@ -111,31 +118,22 @@ def compute_embeddings(frame: np.ndarray,
     if budget_ms <= 0:
         remaining_ms = float("inf")
     else:
+        if on_cuda:
+            torch.cuda.synchronize()
         used_ms = (perf_counter() - t0) * 1000.0
         remaining_ms = max(0.0, budget_ms - used_ms)
 
-    # --- 2) Refresh candidates (do within budget)
-    # Make an ordered list of TIDs to refresh: pending backlog first, then this-frame due (oldest first).
-    due_tids_this = [tid for j, tid in enumerate(match_tid) if due_mask[j] and tid is not None]
-    # Order by staleness (older first)
-    def _staleness(tid: int) -> int:
-        return frame_idx - int(scheduler.last_embed_frame.get(int(tid), -10**9))
-    due_order = sorted(set(due_tids_this), key=_staleness, reverse=True)
+    # --- 2) Refresh (optional, strictly honor budget) ---
+    if remaining_ms > 0 and len(active_snapshot) > 0:
+        # Build candidate TIDs (backlog first, then this-frame due, ordered by staleness)
+        def _stale_score(tid: int) -> int:
+            return frame_idx - int(scheduler.last_embed_frame.get(int(tid), -10**9))
 
-    # combine backlog + this frame due, preserving backlog order priority
-    candidates: list[int] = list(scheduler.pending_refresh) + [t for t in due_order if t not in scheduler.pending_refresh]
+        due_tids_this = [tid for j, tid in enumerate(match_tid) if due_mask[j] and tid is not None]
+        due_order = sorted(set(due_tids_this), key=_stale_score, reverse=True)
+        candidates = list(scheduler.pending_refresh) + [t for t in due_order if t not in scheduler.pending_refresh]
 
-    # Decide how many we can afford this frame
-    if remaining_ms == float("inf"):
-        k_refresh = len(candidates)
-    else:
-        # estimate how many will fit
-        est_ms = max(0.5, scheduler.ms_per_crop_ema)  # guard
-        k_refresh = int(remaining_ms / est_ms + 1e-6)
-        k_refresh = min(k_refresh, len(candidates))
-
-    if k_refresh > 0 and len(active_snapshot) > 0:
-        # Map chosen tids -> current det indices by IoU to ACTIVE boxes
+        # Map tid -> best det index (highest IoU to ACTIVE box)
         A = np.stack([t.box for t in active_snapshot], axis=0).astype(np.float32)
         # IoU(A, boxes)
         x11, y11, x12, y12 = A[:,0][:,None], A[:,1][:,None], A[:,2][:,None], A[:,3][:,None]
@@ -152,38 +150,46 @@ def compute_embeddings(frame: np.ndarray,
         for det_j in range(N):
             trk_i = int(I[:, det_j].argmax()) if I.shape[0] else 0
             tid = int(active_snapshot[trk_i].tid)
-            # keep the highest IoU assignment per tid
             if (tid not in best_det_for_tid) or (I[trk_i, det_j] > I[trk_i, best_det_for_tid[tid]]):
                 best_det_for_tid[tid] = det_j
 
-        chosen_tids = []
-        idx_refresh = []
+        # Iterate one-by-one (or small chunks) and stop when budget is exhausted
+        # one-by-one is simplest & safest for strict budgets:
+        chosen_now: list[int] = []
         for tid in candidates:
-            if len(chosen_tids) >= k_refresh:
-                break
-            j = best_det_for_tid.get(int(tid), None)
-            if j is None:
+            if budget_ms <= 0:
+                chosen_now.append(int(tid))
                 continue
-            if j in idx_crit:
-                continue  # already computed
-            if j in idx_refresh:
+            if on_cuda:
+                torch.cuda.synchronize()
+            used_ms = (perf_counter() - t0) * 1000.0
+            remaining_ms = max(0.0, budget_ms - used_ms)
+            est = max(0.5, scheduler.ms_per_crop_ema)
+            if remaining_ms < est:
+                break  # would exceed budget
+            chosen_now.append(int(tid))
+
+        idx_refresh: list[int] = []
+        for tid in chosen_now:
+            j = best_det_for_tid.get(int(tid))
+            if j is None or j in idx_crit or j in idx_refresh:
                 continue
-            chosen_tids.append(int(tid))
             idx_refresh.append(int(j))
 
         if len(idx_refresh) > 0:
             t2 = perf_counter()
             embs_ref = embedder.embed_crops(frame, boxes[np.array(idx_refresh, dtype=int)])
-            embs[np.array(idx_refresh, dtype=int)] = embs_ref
+            if on_cuda:
+                torch.cuda.synchronize()
             batch_ms = (perf_counter() - t2) * 1000.0
+            embs[np.array(idx_refresh, dtype=int)] = embs_ref
             scheduler.update_ema_ms_per_crop(batch_ms, len(idx_refresh))
             scheduler.stat_real += len(idx_refresh)
             refreshed_tids |= scheduler.mark_refreshed(active_snapshot, boxes, np.array(idx_refresh, dtype=int), frame_idx)
+            scheduler._remove_pending(chosen_now)  # keep leftover in backlog
 
-            # Remove chosen tids from backlog; keep the rest for next frame
-            scheduler._remove_pending(chosen_tids)
-
-    # Anything not processed stays in scheduler.pending_refresh automatically
+    if on_cuda:
+        torch.cuda.synchronize()
     return embs, (perf_counter() - t0), refreshed_tids
 
 
@@ -211,8 +217,15 @@ def main():
     # Init modules
     detector = Detector(args.det, device=device, imgsz=args.imgsz)
 
+    amp = args.embed_amp
+    if amp == "auto":
+        cc = torch.cuda.get_device_capability(0) if torch.cuda.is_available() else (0,0)
+        amp = "bf16" if cc[0] >= 8 else "fp16"  # Ampere+ -> bf16, Turing (T4) -> fp16
+
     embedder = create_extractor(
-        args.embedder, args.embed_model, device, autocast=(device == "cuda"),
+        args.embedder, args.embed_model, device,
+        autocast=(device=="cuda"),
+        amp_dtype=("fp16" if amp=="fp16" else "bf16" if amp=="bf16" else None),
         pad=args.crop_pad, square=args.crop_square
     )
 
