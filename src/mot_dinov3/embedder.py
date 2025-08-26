@@ -169,36 +169,44 @@ class DinoV3Embedder:
 
     # ---------- Public API ----------
 
+    # src/mot_dinov3/embedder.py  (only the embed_crops signature/body changed; defaults preserve behavior)
     @torch.inference_mode()
-    def embed_crops(self, frame_bgr: np.ndarray, boxes_xyxy: np.ndarray) -> np.ndarray:
-        """
-        frame_bgr: HxWx3 uint8 (OpenCV BGR)
-        boxes_xyxy: (N,4) float/ints in absolute pixel coords
-        returns: (N, D) float32 (L2-normalized)
-        """
+    def embed_crops(self, frame_bgr: np.ndarray, boxes_xyxy: np.ndarray,
+                    pad_ratio: float = 0.12, square: bool = True) -> np.ndarray:
         if boxes_xyxy is None or len(boxes_xyxy) == 0:
-            # emb_dim is probed in __init__
             return np.zeros((0, getattr(self, "emb_dim", 768)), dtype=np.float32)
 
         h, w = frame_bgr.shape[:2]
-        pil_batch: List[Image.Image] = []
+        pil_batch: list[Image.Image] = []
         for (x1, y1, x2, y2) in boxes_xyxy.astype(int):
+            # expand box
+            bw, bh = x2 - x1, y2 - y1
+            if square:
+                s = max(bw, bh)
+                cx, cy = x1 + bw / 2, y1 + bh / 2
+                x1, x2 = int(round(cx - s / 2)), int(round(cx + s / 2))
+                y1, y2 = int(round(cy - s / 2)), int(round(cy + s / 2))
+                bw, bh = x2 - x1, y2 - y1
+            if pad_ratio > 0:
+                px, py = int(round(bw * pad_ratio)), int(round(bh * pad_ratio))
+                x1, y1, x2, y2 = x1 - px, y1 - py, x2 + px, y2 + py
+
+            # clamp & minimum size
             x1, y1 = max(0, x1), max(0, y1)
             x2, y2 = min(w - 1, x2), min(h - 1, y2)
             if x2 <= x1 or y2 <= y1:
                 x2, y2 = min(w - 1, x1 + 2), min(h - 1, y1 + 2)
+
             crop = cv2.cvtColor(frame_bgr[y1:y2, x1:x2], cv2.COLOR_BGR2RGB)
             pil_batch.append(Image.fromarray(crop))
 
         inputs = self._prep_inputs(pil_batch)
-
+        out = self.model(**inputs) if not self.use_autocast else \
+            (torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__() or self.model(**inputs))
         if self.use_autocast:
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                out = self.model(**inputs)
-        else:
-            out = self.model(**inputs)
+            torch.autocast(device_type="cuda", dtype=torch.bfloat16).__exit__(None, None, None)
 
-        if getattr(self, "_use_pooled", False) and hasattr(out, "pooler_output") and out.pooler_output is not None:
+        if getattr(out, "pooler_output", None) is not None:
             emb = out.pooler_output
         else:
             toks = out.last_hidden_state
