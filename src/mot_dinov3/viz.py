@@ -59,12 +59,14 @@ def _draw_label(img: np.ndarray, x: int, y: int, text: str,
 
 # ---------- Public API ----------
 
-def draw_tracks(frame: np.ndarray,
-                tracks,
-                draw_lost: bool = False,
-                thickness: int = 2,
-                font_scale: float = 0.5,
-                mark_tids: set[int] | None = None) -> np.ndarray:
+def draw_tracks(
+    frame: np.ndarray,
+    tracks,
+    draw_lost: bool = False,
+    thickness: int = 2,
+    font_scale: float = 0.5,
+    mark_tids: set[int] | None = None
+) -> np.ndarray:
     """
     Draw colored boxes + 'ID <tid>' labels for tracks.
 
@@ -83,27 +85,31 @@ def draw_tracks(frame: np.ndarray,
         if not draw_lost and state != "active":
             continue
 
+        # Clamp box
         x1, y1, x2, y2 = [int(v) for v in t.box]
         x1 = max(0, min(W - 1, x1)); x2 = max(0, min(W - 1, x2))
         y1 = max(0, min(H - 1, y1)); y2 = max(0, min(H - 1, y2))
 
         color = _id_to_color(int(t.tid))
+
+        # Dim color a bit for LOST tracks so it's visually distinct
+        if state != "active":
+            color = tuple(int(c * 0.6) for c in color)
+
+        # Box
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness, cv2.LINE_AA)
 
-        label = f"ID {t.tid}"
+        # Label: ID, optional class, star if embedded this frame, and state
+        starred = (t.tid in mark_tids)
+        parts = [f"ID {t.tid}{'*' if starred else ''}"]
         if getattr(t, "cls", None) is not None:
-            label += f" (c{int(t.cls)})"   # or map id -> class name if you have a list
-
-        # if you already mark embed-computed tracks with a star:
-        if star_ids is not None and t.tid in star_ids:
-            label += " *"
-
-        if hasattr(t, "cls") and t.cls is not None:
-            label += f" | c{int(t.cls)}"
+            parts.append(f"c{int(t.cls)}")
         if state != "active":
-            label += " (lost)"
+            parts.append("(lost)")
+        label = " | ".join(parts)
 
         _draw_label(frame, x1, y1, label, color, font_scale=font_scale, thickness=1)
 
     return frame
+
 

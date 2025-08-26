@@ -1,9 +1,9 @@
 # cli.py
 import os
 from dotenv import load_dotenv
-load_dotenv()  # pick up HUGGINGFACE_HUB_TOKEN from .env
+load_dotenv()  # pick up HF_TOKEN / HUGGINGFACE_HUB_TOKEN from .env
 
-import argparse, sys, time
+import argparse, sys
 from time import perf_counter
 import numpy as np, cv2, torch
 from tqdm.auto import tqdm
@@ -24,10 +24,13 @@ def parse_args():
     ap.add_argument("--source", type=str, required=True, help="Path to input video")
     ap.add_argument("--output", type=str, default="outputs/tracked.mp4", help="Output video path")
     ap.add_argument("--det", type=str, default="yolov8n.pt", help="Ultralytics model path or name")
+
+    # legacy / retained for convenience (you'll mostly use --embed-model now)
     ap.add_argument("--dinov3", type=str, default="facebook/dinov3-vitb16-pretrain-lvd1689m",
                     help="HF model id (e.g., facebook/dinov3-..., or open: facebook/dinov2-base)")
     ap.add_argument("--fallback-open", action="store_true",
                     help="If gated access is denied, automatically fall back to facebook/dinov2-base")
+
     ap.add_argument("--conf", type=float, default=0.3, help="Detector confidence threshold")
     ap.add_argument("--imgsz", type=int, default=960, help="Detector input size")
     ap.add_argument("--classes", type=str, default="", help="Comma-separated class ids to keep (optional)")
@@ -35,18 +38,21 @@ def parse_args():
     ap.add_argument("--cpu", action="store_true", help="Force CPU")
     ap.add_argument("--no-hungarian", action="store_true", help="Use greedy assignment instead of Hungarian")
 
+    # tracker robustness knobs
     ap.add_argument("--class-penalty", type=float, default=0.15, help="Additive cost if det class != track stable class")
     ap.add_argument("--conf-high", type=float, default=0.5, help="High-confidence threshold for Stage-1")
     ap.add_argument("--conf-low", type=float, default=0.1, help="Low-confidence threshold for Stage-1b")
     ap.add_argument("--conf-min-update", type=float, default=0.3, help="Only update emb/class when det_conf >= this")
     ap.add_argument("--conf-update-weight", type=float, default=0.5, help="EMA strength scaling with det_conf (0..1)")
-    ap.add_argument("--low-conf-iou-only", action="store_true", default=True, help="Use IoU-only cost for low-conf pass to avoid drift")
+    ap.add_argument("--low-conf-iou-only", action="store_true", default=True,
+                    help="Use IoU-only cost for low-conf pass to avoid drift")
     ap.add_argument("--reid-sim-thr", type=float, default=0.6, help="Appearance similarity threshold to revive LOST")
     ap.add_argument("--max-age", type=int, default=30, help="Frames before ACTIVE becomes LOST")
     ap.add_argument("--reid-max-age", type=int, default=60, help="Frames to keep LOST before pruning")
     ap.add_argument("--center-gate-base", type=float, default=50.0, help="Re-ID center gate base radius (px)")
     ap.add_argument("--center-gate-slope", type=float, default=10.0, help="Gate growth per frame lost (px/frame)")
 
+    # embedding backend + scheduling
     ap.add_argument("--embedder", type=str, default="dino", help="Embedding backend: dino (default), clip, resnet, ...")
     ap.add_argument("--embed-model", type=str, default="facebook/dinov3-vitb16-pretrain-lvd1689m",
                     help="Embedding model id/name for the chosen embedder")
@@ -62,6 +68,7 @@ def parse_args():
     ap.add_argument("--embed-budget-ms", type=float, default=0.0,
                     help="Max ms per frame for embedding work (0 = unlimited). Budget applies to refresh work only.")
 
+    # draw
     ap.add_argument("--draw-lost", action="store_true", help="Also draw LOST tracks")
     ap.add_argument("--line-thickness", type=int, default=2, help="BBox line thickness")
     ap.add_argument("--font-scale", type=float, default=0.5, help="Label font scale")
@@ -70,8 +77,18 @@ def parse_args():
     return ap.parse_args()
 
 
-def _fmt_ms(s):  # seconds -> "xx.x ms"
+def _fmt_ms(s: float) -> str:  # seconds -> "xx.x ms"
     return f"{s * 1000:.1f} ms"
+
+
+def _get_embedder_device(embedder) -> str:
+    # DINOExtractor exposes the DinoV3Embedder as ._e; prefer explicit .device if present
+    dev = getattr(embedder, "device", None)
+    if dev is None and hasattr(embedder, "_e"):
+        dev = getattr(embedder._e, "device", None)
+    if isinstance(dev, torch.device):
+        return dev.type
+    return str(dev or "cpu")
 
 
 def compute_embeddings(frame: np.ndarray,
@@ -90,13 +107,13 @@ def compute_embeddings(frame: np.ndarray,
       t_emb_seconds  : total seconds spent in this step
       refreshed_tids : set of tids whose embedding was (re)computed this frame
     """
-    on_cuda = (getattr(embedder, "device", "cpu") == "cuda")
+    on_cuda = (_get_embedder_device(embedder) == "cuda")
     if on_cuda:
-        torch.cuda.synchronize()  # start with a clean slate for timing
+        torch.cuda.synchronize()
     t0 = perf_counter()
 
     N = len(boxes)
-    D = int(getattr(embedder, "emb_dim", 768))
+    D = int(getattr(embedder, "dim", getattr(embedder, "emb_dim", 768)))
     if N == 0:
         return np.zeros((0, D), dtype=np.float32), 0.0, set()
 
@@ -137,7 +154,6 @@ def compute_embeddings(frame: np.ndarray,
 
     # --- 2) Refresh (optional, strictly honor budget) ---
     if remaining_ms > 0 and len(active_snapshot) > 0:
-        # Build candidate TIDs (backlog first, then this-frame due, ordered by staleness)
         def _stale_score(tid: int) -> int:
             return frame_idx - int(scheduler.last_embed_frame.get(int(tid), -10**9))
 
@@ -145,31 +161,32 @@ def compute_embeddings(frame: np.ndarray,
         due_order = sorted(set(due_tids_this), key=_stale_score, reverse=True)
         candidates = list(scheduler.pending_refresh) + [t for t in due_order if t not in scheduler.pending_refresh]
 
-        # Map tid -> best det index (highest IoU to ACTIVE box)
-        A = np.stack([t.box for t in active_snapshot], axis=0).astype(np.float32)
-        # IoU(A, boxes)
-        x11, y11, x12, y12 = A[:,0][:,None], A[:,1][:,None], A[:,2][:,None], A[:,3][:,None]
+        # IoU between ACTIVE boxes and current detections (for picking best det per tid)
+        A = np.stack([t.box for t in active_snapshot], axis=0).astype(np.float32) if len(active_snapshot) else np.zeros((0,4), np.float32)
         B = boxes.astype(np.float32)
-        x21, y21, x22, y22 = B[:,0][None,:], B[:,1][None,:], B[:,2][None,:], B[:,3][None,:]
-        inter_w = np.maximum(0, np.minimum(x12, x22) - np.maximum(x11, x21))
-        inter_h = np.maximum(0, np.minimum(y12, y22) - np.maximum(y11, y21))
-        inter = inter_w * inter_h
-        area_a = (x12 - x11) * (y12 - y11)
-        area_b = (x22 - x21) * (y22 - y21)
-        I = inter / (area_a + area_b - inter + 1e-6)  # (T,N)
+        if len(A) and len(B):
+            x11, y11, x12, y12 = A[:,0][:,None], A[:,1][:,None], A[:,2][:,None], A[:,3][:,None]
+            x21, y21, x22, y22 = B[:,0][None,:], B[:,1][None,:], B[:,2][None,:], B[:,3][None,:]
+            inter_w = np.maximum(0, np.minimum(x12, x22) - np.maximum(x11, x21))
+            inter_h = np.maximum(0, np.minimum(y12, y22) - np.maximum(y11, y21))
+            inter = inter_w * inter_h
+            area_a = (x12 - x11) * (y12 - y11)
+            area_b = (x22 - x21) * (y22 - y21)
+            I = inter / (area_a + area_b - inter + 1e-6)  # (T,N)
+        else:
+            I = np.zeros((0, len(B)), dtype=np.float32)
 
         best_det_for_tid: dict[int, int] = {}
-        for det_j in range(N):
-            trk_i = int(I[:, det_j].argmax()) if I.shape[0] else 0
-            tid = int(active_snapshot[trk_i].tid)
-            if (tid not in best_det_for_tid) or (I[trk_i, det_j] > I[trk_i, best_det_for_tid[tid]]):
-                best_det_for_tid[tid] = det_j
+        if I.size:
+            for det_j in range(N):
+                trk_i = int(I[:, det_j].argmax()) if I.shape[0] else 0
+                tid = int(active_snapshot[trk_i].tid)
+                if (tid not in best_det_for_tid) or (I[trk_i, det_j] > I[trk_i, best_det_for_tid[tid]]):
+                    best_det_for_tid[tid] = det_j
 
-        # Iterate one-by-one (or small chunks) and stop when budget is exhausted
-        # one-by-one is simplest & safest for strict budgets:
         chosen_now: list[int] = []
         for tid in candidates:
-            if budget_ms <= 0:
+            if budget_ms <= 0:  # unlimited
                 chosen_now.append(int(tid))
                 continue
             if on_cuda:
@@ -178,7 +195,7 @@ def compute_embeddings(frame: np.ndarray,
             remaining_ms = max(0.0, budget_ms - used_ms)
             est = max(0.5, scheduler.ms_per_crop_ema)
             if remaining_ms < est:
-                break  # would exceed budget
+                break
             chosen_now.append(int(tid))
 
         idx_refresh: list[int] = []
@@ -198,7 +215,7 @@ def compute_embeddings(frame: np.ndarray,
             scheduler.update_ema_ms_per_crop(batch_ms, len(idx_refresh))
             scheduler.stat_real += len(idx_refresh)
             refreshed_tids |= scheduler.mark_refreshed(active_snapshot, boxes, np.array(idx_refresh, dtype=int), frame_idx)
-            scheduler._remove_pending(chosen_now)  # keep leftover in backlog
+            scheduler._remove_pending(chosen_now)
 
     if on_cuda:
         torch.cuda.synchronize()
@@ -209,7 +226,10 @@ def main():
     args = parse_args()
     device = "cpu" if args.cpu else ("cuda" if torch.cuda.is_available() else "cpu")
 
-    os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    out_dir = os.path.dirname(args.output)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
     cap = cv2.VideoCapture(args.source)
     assert cap.isOpened(), f"Could not open {args.source}"
 
@@ -231,13 +251,16 @@ def main():
 
     amp = args.embed_amp
     if amp == "auto":
-        cc = torch.cuda.get_device_capability(0) if torch.cuda.is_available() else (0,0)
-        amp = "bf16" if cc[0] >= 8 else "fp16"  # Ampere+ -> bf16, Turing (T4) -> fp16
+        if torch.cuda.is_available():
+            cc = torch.cuda.get_device_capability(0)
+            amp = "bf16" if cc[0] >= 8 else "fp16"  # Ampere+ -> bf16, Turing (T4) -> fp16
+        else:
+            amp = "off"
 
     embedder = create_extractor(
         args.embedder, args.embed_model, device,
-        autocast=(device=="cuda"),
-        amp_dtype=("fp16" if amp=="fp16" else "bf16" if amp=="bf16" else None),
+        autocast=(device == "cuda"),
+        amp_dtype=("fp16" if amp == "fp16" else "bf16" if amp == "bf16" else None),
         pad=args.crop_pad, square=args.crop_square
     )
 
@@ -286,7 +309,7 @@ def main():
     # Timers / stats
     t_start = perf_counter()
     frames = 0
-    frame_idx = 0  # <-- needed by the scheduler
+    frame_idx = 0  # needed by scheduler
     ema_fps = None
     alpha = 0.15  # smoothing for FPS
 
@@ -316,7 +339,6 @@ def main():
             boxes, confs, clses = boxes[m], confs[m], clses[m]
 
         # --- EMBED ---
-        
         embs, t_emb, refreshed_tids = compute_embeddings(
             frame, boxes, embedder, tracker, sched, frame_idx, budget_ms=args.embed_budget_ms
         )
@@ -328,11 +350,13 @@ def main():
 
         # --- DRAW ---
         t = perf_counter()
-        draw_tracks(frame, tracks,
+        draw_tracks(
+            frame, tracks,
             draw_lost=args.draw_lost,
             thickness=args.line_thickness,
             font_scale=args.font_scale,
-            mark_tids=refreshed_tids)    
+            mark_tids=refreshed_tids   # label gets a "*" if an embed was computed this frame
+        )
         t_draw = perf_counter() - t
 
         # --- WRITE ---
@@ -343,7 +367,7 @@ def main():
         # Totals / stats
         f_dt = perf_counter() - f0
         frames += 1
-        frame_idx += 1  # bump every processed frame
+        frame_idx += 1
         frame_times.append(f_dt)
         acc_read += t_read
         acc_det += t_det
@@ -376,9 +400,8 @@ def main():
     mean_ms = 1000.0 * acc_frame / max(1, frames)
     eff_fps = frames / max(1e-9, elapsed)
 
-    # Percent breakdown by stage
     def pct(x): return 100.0 * x / max(1e-9, acc_frame)
-    # p50/p95 frame latency (ms)
+
     if frame_times:
         arr = np.array(frame_times, dtype=np.float64) * 1000.0
         p50 = float(np.percentile(arr, 50))
@@ -401,7 +424,7 @@ def main():
     print(f"  write : {_fmt_ms(acc_write / max(1, frames))} | {pct(acc_write):5.1f}%")
     other = max(0.0, acc_frame - (acc_read + acc_det + acc_emb + acc_track + acc_draw + acc_write))
     print(f"  other : {_fmt_ms(other / max(1, frames))}  | {pct(other):5.1f}%")
-    print(f"Done. Wrote {args.output}. {frames} frames in {elapsed:.1f}s")
+    print(f"Done. Wrote {args.output}. {elapsed:.1f}s total")
     print(sched.summary(frames))
 
 
