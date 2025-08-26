@@ -1,4 +1,4 @@
-# mot-dinov3 / Multi-Object Tracker DINOv3
+ # Multi-Object Tracker DINOv3
 
 DINOv3/DINOv2 embeddings + YOLO detection + simple MOT (Hungarian) with cosine appearance matching.  
 Progress bar + per-stage timing stats built-in.
