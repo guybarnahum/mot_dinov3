@@ -15,6 +15,7 @@ from mot_dinov3.detector import Detector
 from mot_dinov3.embedder import DinoV3Embedder, GatedModelAccessError
 from mot_dinov3.features.factory import create_extractor
 from mot_dinov3.tracker import SimpleTracker
+from mot_dinov3.scheduler import EmbeddingScheduler, SchedulerConfig
 from mot_dinov3.viz import draw_tracks
 
 def parse_args():
@@ -39,6 +40,10 @@ def parse_args():
 
     ap.add_argument("--crop-pad", type=float, default=0.12, help="Padding ratio around det box for embeddings")
     ap.add_argument("--crop-square", action="store_true", default=True,help="Use square crops for embeddings (default on)")
+
+    ap.add_argument("--embed-refresh", type=int, default=5, help="Refresh real embedding every N frames")
+    ap.add_argument("--embed-iou-gate", type=float, default=0.6, help="IoU ≥ gate → treat as stable candidate")
+    ap.add_argument("--embed-overlap-thr", type=float, default=0.2, help="Det-det IoU > thr marks crowded")
 
     ap.add_argument("--draw-lost", action="store_true", help="Also draw LOST tracks")
     ap.add_argument("--line-thickness", type=int, default=2, help="BBox line thickness")
@@ -80,6 +85,12 @@ def main():
                             pad=args.crop_pad, square=args.crop_square)
                            
     tracker = SimpleTracker(use_hungarian=not args.no_hungarian)
+
+    sched = EmbeddingScheduler(SchedulerConfig(
+        overlap_thr=args.embed_overlap_thr,
+        iou_gate=args.embed_iou_gate,
+        refresh_every=args.embed_refresh,
+    ))
 
     keep_ids = None
     if args.classes.strip():
@@ -128,7 +139,29 @@ def main():
         # --- EMBED ---
         t = perf_counter()
 
-        embs = embedder.embed_crops(frame, boxes, pad_ratio=args.crop_pad, square=args.crop_square)
+        # embs = embedder.embed_crops(frame, boxes, pad_ratio=args.crop_pad, square=args.crop_square)
+        # Decide which detections need real embeddings
+        need_mask, reuse_tids, active_snapshot = sched.plan(tracker, boxes, frame_idx)
+
+        # Prepare embedding array
+        embs = np.zeros((len(boxes), getattr(embedder, "emb_dim", 768)), dtype=np.float32)
+
+        # Reuse cached embeddings where allowed
+        if len(active_snapshot):
+            tid2emb = {int(t.tid): t.emb for t in active_snapshot}
+            for j, tid in enumerate(reuse_tids):
+                if tid is not None:
+                    embs[j] = tid2emb[tid]
+                    sched.stat_reuse += 1
+
+        # Compute real embeddings only for needed subset
+        idx_need = np.nonzero(need_mask)[0]
+        if len(idx_need) > 0:
+            embs_need = embedder.embed_crops(frame, boxes[idx_need])
+            embs[idx_need] = embs_need
+            sched.stat_real += len(idx_need)
+            # mark refresh timestamps for the matched tracks (IoU to active snapshot)
+            sched.mark_refreshed(active_snapshot, boxes, idx_need, frame_idx)
 
         t_emb = perf_counter() - t
 
@@ -207,8 +240,8 @@ def main():
     print(f"  write : {_fmt_ms(acc_write / max(1, frames))} | {pct(acc_write):5.1f}%")
     other = max(0.0, acc_frame - (acc_read + acc_det + acc_emb + acc_track + acc_draw + acc_write))
     print(f"  other : {_fmt_ms(other / max(1, frames))}  | {pct(other):5.1f}%")
-    print(f"\nDone. Wrote {args.output}.")
-
+    print(f"Done. Wrote {args.output}. {frames} frames in {time.time()-t0:.1f}s")
+    print(sched.summary(frames))
 
 if __name__ == "__main__":
     try:
