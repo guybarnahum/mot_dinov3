@@ -13,9 +13,9 @@ compat.apply(strict_numpy=False, quiet=True)
 
 from mot_dinov3.detector import Detector
 from mot_dinov3.embedder import DinoV3Embedder, GatedModelAccessError
+from mot_dinov3.features.factory import create_extractor
 from mot_dinov3.tracker import SimpleTracker
 from mot_dinov3.viz import draw_tracks
-
 
 def parse_args():
     ap = argparse.ArgumentParser(description="DINOv3-based MOT (tracking-by-detection)")
@@ -32,21 +32,20 @@ def parse_args():
     ap.add_argument("--fps", type=float, default=0.0, help="Force output FPS (0 uses source FPS)")
     ap.add_argument("--cpu", action="store_true", help="Force CPU")
     ap.add_argument("--no-hungarian", action="store_true", help="Use greedy assignment instead of Hungarian")
+
+    ap.add_argument("--embedder", type=str, default="dino", help="Embedding backend: dino (default), clip, resnet, ...")
+    ap.add_argument("--embed-model", type=str, default="facebook/dinov3-vitb16-pretrain-lvd1689m",
+                    help="Embedding model id/name for the chosen embedder")
+
+    ap.add_argument("--crop-pad", type=float, default=0.12, help="Padding ratio around det box for embeddings")
+    ap.add_argument("--crop-square", action="store_true", default=True,help="Use square crops for embeddings (default on)")
+
+    ap.add_argument("--draw-lost", action="store_true", help="Also draw LOST tracks")
+    ap.add_argument("--line-thickness", type=int, default=2, help="BBox line thickness")
+    ap.add_argument("--font-scale", type=float, default=0.5, help="Label font scale")
+
     ap.add_argument("--debug", action="store_true", help="Show full tracebacks for debugging")
     return ap.parse_args()
-
-
-def build_embedder(model_id: str, device: str, autocast: bool, allow_fallback: bool):
-    try:
-        return DinoV3Embedder(model_id, device=device, use_autocast=autocast)
-    except GatedModelAccessError as e:
-        # Print only the friendly message
-        print(str(e))
-        if allow_fallback:
-            fb = "facebook/dinov2-base"
-            print(f"\n⚠️  Falling back to open model: {fb}\n")
-            return DinoV3Embedder(fb, device=device, use_autocast=autocast)
-        sys.exit(2)
 
 
 def _fmt_ms(s):  # seconds -> "xx.x ms"
@@ -76,8 +75,10 @@ def main():
 
     # Init modules
     detector = Detector(args.det, device=device, imgsz=args.imgsz)
-    embedder = build_embedder(args.dinov3, device=device, autocast=(device == "cuda"),
-                              allow_fallback=args.fallback_open)
+    
+    embedder = create_extractor(args.embedder, args.embed_model, device, autocast=(device=="cuda"),
+                            pad=args.crop_pad, square=args.crop_square)
+                           
     tracker = SimpleTracker(use_hungarian=not args.no_hungarian)
 
     keep_ids = None
@@ -126,16 +127,19 @@ def main():
 
         # --- EMBED ---
         t = perf_counter()
-        embs = embedder.embed_crops(frame, boxes)
+
+        embs = embedder.embed_crops(frame, boxes, pad_ratio=args.crop_pad, square=args.crop_square)
+
         t_emb = perf_counter() - t
 
         # --- TRACK + DRAW ---
         t = perf_counter()
-        tracks = tracker.update(boxes, embs)
+        tracks = tracker.update(boxes, embs, confs=confs, clses=clses)
         t_track = perf_counter() - t
 
         t = perf_counter()
-        draw_tracks(frame, tracks)
+        # in the frame loop
+        draw_tracks(frame, tracks, draw_lost=args.draw_lost, thickness=args.line_thickness, font_scale=args.font_scale)
         t_draw = perf_counter() - t
 
         # --- WRITE ---

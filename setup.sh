@@ -57,7 +57,7 @@ run_and_log() {
   local log_file; log_file=$(mktemp)
   local description="$1"; shift
 
-  printf "⏳ %s\n" "$description"
+  # printf "⏳ %s\n" "$description"
   tput civis 2>/dev/null || true
 
   local prev_render=""
