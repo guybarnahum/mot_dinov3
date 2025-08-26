@@ -58,17 +58,17 @@ def _fmt_ms(s):  # seconds -> "xx.x ms"
     return f"{s * 1000:.1f} ms"
 
 
-# --- NEW: one helper that handles plan→reuse→compute→mark and timing ---
 def compute_embeddings(frame: np.ndarray,
                        boxes: np.ndarray,
                        embedder,
                        tracker,
                        scheduler: EmbeddingScheduler,
-                       frame_idx: int) -> tuple[np.ndarray, float]:
+                       frame_idx: int) -> tuple[np.ndarray, float, set[int]]:
     """
     Returns:
       embs: (N,D) float32
       t_emb: seconds spent in the embedding step (planning+compute+mark)
+      refreshed_tids: set of track IDs whose embedding was (re)computed this frame
     Side-effects:
       - updates scheduler.stat_real / scheduler.stat_reuse
       - updates scheduler.last_embed_frame via mark_refreshed()
@@ -78,13 +78,14 @@ def compute_embeddings(frame: np.ndarray,
     N = len(boxes)
     D = int(getattr(embedder, "emb_dim", 768))
     if N == 0:
-        return np.zeros((0, D), dtype=np.float32), 0.0
+        return np.zeros((0, D), dtype=np.float32), 0.0, set()
 
     need_mask, reuse_tids, active_snapshot = scheduler.plan(tracker, boxes, frame_idx)
 
     embs = np.zeros((N, D), dtype=np.float32)
 
     # Reuse from ACTIVE tracks when allowed
+    refreshed_tids: set[int] = set()
     if len(active_snapshot):
         tid2emb = {int(t.tid): t.emb for t in active_snapshot}
         for j, tid in enumerate(reuse_tids):
@@ -98,9 +99,10 @@ def compute_embeddings(frame: np.ndarray,
         embs_need = embedder.embed_crops(frame, boxes[idx_need])
         embs[idx_need] = embs_need
         scheduler.stat_real += len(idx_need)
-        scheduler.mark_refreshed(active_snapshot, boxes, idx_need, frame_idx)
+        # Record which track ids were refreshed (also updates timestamps)
+        refreshed_tids = scheduler.mark_refreshed(active_snapshot, boxes, idx_need, frame_idx)
 
-    return embs, (perf_counter() - t0)
+    return embs, (perf_counter() - t0), refreshed_tids
 
 
 def main():
@@ -186,8 +188,8 @@ def main():
             m = np.array([c in keep_ids for c in clses], dtype=bool)
             boxes, confs, clses = boxes[m], confs[m], clses[m]
 
-        # --- EMBED (via helper) ---
-        embs, t_emb = compute_embeddings(frame, boxes, embedder, tracker, sched, frame_idx)
+        # --- EMBED ---
+        embs, t_emb, refreshed_tids = compute_embeddings(frame, boxes, embedder, tracker, sched, frame_idx)
 
         # --- TRACK ---
         t = perf_counter()
@@ -196,7 +198,11 @@ def main():
 
         # --- DRAW ---
         t = perf_counter()
-        draw_tracks(frame, tracks, draw_lost=args.draw_lost, thickness=args.line_thickness, font_scale=args.font_scale)
+        draw_tracks(frame, tracks,
+            draw_lost=args.draw_lost,
+            thickness=args.line_thickness,
+            font_scale=args.font_scale,
+            mark_tids=refreshed_tids)    
         t_draw = perf_counter() - t
 
         # --- WRITE ---

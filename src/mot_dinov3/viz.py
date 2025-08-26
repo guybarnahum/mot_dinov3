@@ -60,41 +60,29 @@ def _draw_label(img: np.ndarray, x: int, y: int, text: str,
 # ---------- Public API ----------
 
 def draw_tracks(frame: np.ndarray,
-                tracks: Iterable,
+                tracks,
                 draw_lost: bool = False,
                 thickness: int = 2,
-                font_scale: float = 0.5) -> np.ndarray:
+                font_scale: float = 0.5,
+                mark_tids: set[int] | None = None) -> np.ndarray:
     """
     Draw colored boxes + 'ID <tid>' labels for tracks.
 
-    Parameters
-    ----------
-    frame : np.ndarray
-        BGR image (modified in place and also returned).
-    tracks : Iterable
-        Iterable of Track-like objects with fields:
-          - tid (int)
-          - box (np.ndarray [4] xyxy)
-          - state (str: 'active' | 'lost' | 'removed') [optional; defaults active]
-          - cls (int | None) [optional]
-    draw_lost : bool
-        If True, also draw LOST tracks (annotated '(lost)').
-    thickness : int
-        Rectangle line thickness.
-    font_scale : float
-        Label font scale.
+    mark_tids:
+        Optional set of track IDs. If a track's ID is in this set, a '*' is appended
+        to the label to indicate the embedding was computed this frame.
     """
     if tracks is None:
         return frame
 
     H, W = frame.shape[:2]
+    mark_tids = mark_tids or set()
 
     for t in tracks:
         state = getattr(t, "state", "active")
         if not draw_lost and state != "active":
             continue
 
-        # box + clamp
         x1, y1, x2, y2 = [int(v) for v in t.box]
         x1 = max(0, min(W - 1, x1)); x2 = max(0, min(W - 1, x2))
         y1 = max(0, min(H - 1, y1)); y2 = max(0, min(H - 1, y2))
@@ -103,6 +91,8 @@ def draw_tracks(frame: np.ndarray,
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness, cv2.LINE_AA)
 
         label = f"ID {int(t.tid)}"
+        if int(t.tid) in mark_tids:
+            label += " *"
         if hasattr(t, "cls") and t.cls is not None:
             label += f" | c{int(t.cls)}"
         if state != "active":
@@ -111,3 +101,4 @@ def draw_tracks(frame: np.ndarray,
         _draw_label(frame, x1, y1, label, color, font_scale=font_scale, thickness=1)
 
     return frame
+

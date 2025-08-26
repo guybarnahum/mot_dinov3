@@ -84,19 +84,35 @@ class EmbeddingScheduler:
             reuse_tid[j] = tid
         return need_mask, reuse_tid, active
 
-    def mark_refreshed(self, active_snapshot: list, boxes: np.ndarray, idx_need: np.ndarray, frame_idx: int):
+    def mark_refreshed(self, active_snapshot: list, boxes: np.ndarray, idx_need: np.ndarray, frame_idx: int) -> set[int]:
         """
         After computing real embeddings for detections idx_need (on the same frame),
         assign those refreshes to the most plausible ACTIVE track by IoU to its *current* box.
+
+        Returns:
+            Set of track IDs that were marked as refreshed for this frame.
         """
+        refreshed: set[int] = set()
         if len(idx_need) == 0 or len(active_snapshot) == 0:
-            return
+            return refreshed
         A = np.stack([t.box for t in active_snapshot], axis=0).astype(np.float32)
-        I = _iou_xyxy(A, boxes)  # (T,N)
+        # local IoU util to avoid import cycles
+        x11, y11, x12, y12 = A[:, 0][:, None], A[:, 1][:, None], A[:, 2][:, None], A[:, 3][:, None]
+        B = boxes.astype(np.float32)
+        x21, y21, x22, y22 = B[:, 0][None, :], B[:, 1][None, :], B[:, 2][None, :], B[:, 3][None, :]
+        inter_w = np.maximum(0, np.minimum(x12, x22) - np.maximum(x11, x21))
+        inter_h = np.maximum(0, np.minimum(y12, y22) - np.maximum(y11, y21))
+        inter = inter_w * inter_h
+        area_a = (x12 - x11) * (y12 - y11)
+        area_b = (x22 - x21) * (y22 - y21)
+        I = inter / (area_a + area_b - inter + 1e-6)  # (T, N)
+
         best_idx = I.argmax(axis=0)
         for j in idx_need:
             tid = int(active_snapshot[best_idx[j]].tid)
             self.last_embed_frame[tid] = frame_idx
+            refreshed.add(tid)
+        return refreshed
 
     def summary(self, frames: int) -> str:
         if frames <= 0:
