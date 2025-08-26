@@ -5,6 +5,7 @@ import numpy as np
 import torch, cv2
 from PIL import Image
 from typing import List, Tuple, Optional, Any, Dict
+from contextlib import nullcontext
 
 # Apply shims early (torch compiler / NumPy, and HF token bridge)
 from . import compat as _compat
@@ -26,7 +27,7 @@ class DinoV3Embedder:
     Robust DINO(v3/v2) embedder.
 
     Load order:
-      1) AutoImageProcessor (trust_remote_code=True, use_fast=False)
+      1) AutoImageProcessor (trust_remote_code=True, prefer fast)
       2) If unavailable/unrecognized, build a manual preprocessor from model config:
          - image_size from config (or 224)
          - mean/std from config (or ImageNet)
@@ -41,7 +42,7 @@ class DinoV3Embedder:
         verbose: bool = True,
     ):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.use_autocast = use_autocast and (self.device == "cuda")
+        self.use_autocast = bool(use_autocast and (self.device == "cuda") and torch.cuda.is_available())
         self.model_name = model_name
         self.verbose = verbose
 
@@ -61,7 +62,9 @@ class DinoV3Embedder:
 
         # --- Load model first (we can still run manual preprocessing) ---
         try:
-            self.model = _load_with_token(AutoModel.from_pretrained, model_name, trust_remote_code=True).to(self.device).eval()
+            self.model = _load_with_token(
+                AutoModel.from_pretrained, model_name, trust_remote_code=True
+            ).to(self.device).eval()
         except Exception as e:
             msg = str(e).lower()
             if ("gated repo" in msg) or ("401" in msg and "huggingface" in msg) or ("access to model" in msg):
@@ -82,24 +85,25 @@ class DinoV3Embedder:
         # --- Try to load an image processor (preferred path) ---
         self.processor = None
         try:
-            # use_fast=False prevents the “use_fast True but no fast class” warning
+            # Prefer fast processor (DINOv3 often only ships a *fast* class)
             self.processor = _load_with_token(
                 AutoImageProcessor.from_pretrained,
                 model_name,
-                use_fast=False,
+                use_fast=True,
                 trust_remote_code=True,
             )
             if self.verbose:
-                print(f"[embedder] Using AutoImageProcessor for {model_name}")
+                print(f"[embedder] Using AutoImageProcessor (fast) for {model_name}")
         except Exception as e:
+            # Fall back to manual preprocessing if processor isn't available
             if self.verbose:
-                print(f"[embedder] AutoImageProcessor unavailable for {model_name} → falling back to manual preprocessing ({e})")
+                print(f"[embedder] AutoImageProcessor unavailable for {model_name} → "
+                      f"falling back to manual preprocessing ({e})")
             self._build_manual_preproc()
 
         # --- Probe output dims (pooled vs tokens) ---
         with torch.inference_mode():
-            # Build a minimal dummy input once we know how to preprocess
-            dummy = Image.new("RGB", (self.image_size, self.image_size))
+            dummy = Image.new("RGB", (getattr(self, "image_size", 224), getattr(self, "image_size", 224)))
             inputs = self._prep_inputs([dummy])  # dict with pixel_values
             out = self.model(**inputs)
             if hasattr(out, "pooler_output") and out.pooler_output is not None:
@@ -109,6 +113,24 @@ class DinoV3Embedder:
                 toks = out.last_hidden_state
                 self.emb_dim = int((toks[:, 1:, :].mean(dim=1) if toks.shape[1] > 1 else toks[:, 0, :]).shape[-1])
                 self._use_pooled = False
+
+        # --- Choose autocast dtype (bf16 if supported, else fp16) ---
+        if self.use_autocast:
+            try:
+                bf16_ok = getattr(torch.cuda, "is_bf16_supported", lambda: False)()
+            except Exception:
+                bf16_ok = False
+            self._amp_dtype = torch.bfloat16 if bf16_ok else torch.float16
+        else:
+            self._amp_dtype = torch.float32
+
+        if (self.processor is None) and self.verbose:
+            print("[embedder] Manual preprocess: size=%, mean=%, std=%"
+                  .replace("%", "{}").format(
+                      getattr(self, "image_size", 224),
+                      [float(x) for x in self.mean.reshape(-1)[:3]],
+                      [float(x) for x in self.std.reshape(-1)[:3]]
+                  ))
 
     # ---------- Preprocessing paths ----------
 
@@ -154,7 +176,7 @@ class DinoV3Embedder:
         if self.processor is not None:
             # Preferred path: delegate to HF processor
             batch = self.processor(images=pil_images, return_tensors="pt")
-            return {k: v.to(self.device) for k, v in batch.items()}
+            return {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
 
         # Manual path: resize→toTensor→normalize to model’s expected HxW
         arrs = []
@@ -164,12 +186,16 @@ class DinoV3Embedder:
             a = (a - self.mean) / self.std
             a = a.transpose(2, 0, 1)  # CHW
             arrs.append(a)
-        x = torch.from_numpy(np.stack(arrs, axis=0)).to(self.device)  # [B,3,H,W]
+        x = torch.from_numpy(np.stack(arrs, axis=0)).to(self.device, non_blocking=True)  # [B,3,H,W]
         return {"pixel_values": x}
+
+    def _maybe_autocast(self):
+        if self.use_autocast:
+            return torch.autocast(device_type="cuda", dtype=self._amp_dtype)
+        return nullcontext()
 
     # ---------- Public API ----------
 
-    # src/mot_dinov3/embedder.py  (only the embed_crops signature/body changed; defaults preserve behavior)
     @torch.inference_mode()
     def embed_crops(self, frame_bgr: np.ndarray, boxes_xyxy: np.ndarray,
                     pad_ratio: float = 0.12, square: bool = True) -> np.ndarray:
@@ -177,7 +203,7 @@ class DinoV3Embedder:
             return np.zeros((0, getattr(self, "emb_dim", 768)), dtype=np.float32)
 
         h, w = frame_bgr.shape[:2]
-        pil_batch: list[Image.Image] = []
+        pil_batch: List[Image.Image] = []
         for (x1, y1, x2, y2) in boxes_xyxy.astype(int):
             # expand box
             bw, bh = x2 - x1, y2 - y1
@@ -201,11 +227,12 @@ class DinoV3Embedder:
             pil_batch.append(Image.fromarray(crop))
 
         inputs = self._prep_inputs(pil_batch)
-        out = self.model(**inputs) if not self.use_autocast else \
-            (torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__() or self.model(**inputs))
-        if self.use_autocast:
-            torch.autocast(device_type="cuda", dtype=torch.bfloat16).__exit__(None, None, None)
 
+        # Proper autocast usage (context manager) — no manual __enter__/__exit__
+        with self._maybe_autocast():
+            out = self.model(**inputs)
+
+        # pool -> embedding
         if getattr(out, "pooler_output", None) is not None:
             emb = out.pooler_output
         else:
