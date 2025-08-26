@@ -45,6 +45,8 @@ def parse_args():
     ap.add_argument("--embed-refresh", type=int, default=5, help="Refresh real embedding every N frames")
     ap.add_argument("--embed-iou-gate", type=float, default=0.6, help="IoU ≥ gate → treat as stable candidate")
     ap.add_argument("--embed-overlap-thr", type=float, default=0.2, help="Det-det IoU > thr marks crowded")
+    ap.add_argument("--embed-budget-ms", type=float, default=0.0,
+                    help="Max ms per frame for embedding work (0 = unlimited). Budget applies to refresh work only.")
 
     ap.add_argument("--draw-lost", action="store_true", help="Also draw LOST tracks")
     ap.add_argument("--line-thickness", type=int, default=2, help="BBox line thickness")
@@ -63,15 +65,16 @@ def compute_embeddings(frame: np.ndarray,
                        embedder,
                        tracker,
                        scheduler: EmbeddingScheduler,
-                       frame_idx: int) -> tuple[np.ndarray, float, set[int]]:
+                       frame_idx: int,
+                       budget_ms: float = 0.0) -> tuple[np.ndarray, float, set[int]]:
     """
+    Budgeted embedding computation.
+    - Always computes 'critical' embeddings (new/crowded/weak IoU).
+    - 'Refresh' embeddings are computed only within the remaining budget.
     Returns:
-      embs: (N,D) float32
-      t_emb: seconds spent in the embedding step (planning+compute+mark)
-      refreshed_tids: set of track IDs whose embedding was (re)computed this frame
-    Side-effects:
-      - updates scheduler.stat_real / scheduler.stat_reuse
-      - updates scheduler.last_embed_frame via mark_refreshed()
+      embs           : (N,D) float32
+      t_emb_seconds  : total seconds spent in this step
+      refreshed_tids : set of tids whose embedding was (re)computed this frame
     """
     t0 = perf_counter()
 
@@ -80,12 +83,12 @@ def compute_embeddings(frame: np.ndarray,
     if N == 0:
         return np.zeros((0, D), dtype=np.float32), 0.0, set()
 
-    need_mask, reuse_tids, active_snapshot = scheduler.plan(tracker, boxes, frame_idx)
+    need_mask, reuse_tids, active_snapshot, due_mask, match_tid = scheduler.plan(tracker, boxes, frame_idx)
 
     embs = np.zeros((N, D), dtype=np.float32)
-
-    # Reuse from ACTIVE tracks when allowed
     refreshed_tids: set[int] = set()
+
+    # Reuse where allowed
     if len(active_snapshot):
         tid2emb = {int(t.tid): t.emb for t in active_snapshot}
         for j, tid in enumerate(reuse_tids):
@@ -93,15 +96,94 @@ def compute_embeddings(frame: np.ndarray,
                 embs[j] = tid2emb[tid]
                 scheduler.stat_reuse += 1
 
-    # Compute only for the subset we need
-    idx_need = np.nonzero(need_mask)[0]
-    if len(idx_need) > 0:
-        embs_need = embedder.embed_crops(frame, boxes[idx_need])
-        embs[idx_need] = embs_need
-        scheduler.stat_real += len(idx_need)
-        # Record which track ids were refreshed (also updates timestamps)
-        refreshed_tids = scheduler.mark_refreshed(active_snapshot, boxes, idx_need, frame_idx)
+    # --- 1) Critical set (must compute now)
+    idx_crit = np.nonzero(need_mask & ~due_mask)[0]
+    if len(idx_crit) > 0:
+        t1 = perf_counter()
+        embs_crit = embedder.embed_crops(frame, boxes[idx_crit])
+        embs[idx_crit] = embs_crit
+        batch_ms = (perf_counter() - t1) * 1000.0
+        scheduler.update_ema_ms_per_crop(batch_ms, len(idx_crit))
+        scheduler.stat_real += len(idx_crit)
+        refreshed_tids |= scheduler.mark_refreshed(active_snapshot, boxes, idx_crit, frame_idx)
 
+    # Remaining budget for refresh (ms); 0 => unlimited
+    if budget_ms <= 0:
+        remaining_ms = float("inf")
+    else:
+        used_ms = (perf_counter() - t0) * 1000.0
+        remaining_ms = max(0.0, budget_ms - used_ms)
+
+    # --- 2) Refresh candidates (do within budget)
+    # Make an ordered list of TIDs to refresh: pending backlog first, then this-frame due (oldest first).
+    due_tids_this = [tid for j, tid in enumerate(match_tid) if due_mask[j] and tid is not None]
+    # Order by staleness (older first)
+    def _staleness(tid: int) -> int:
+        return frame_idx - int(scheduler.last_embed_frame.get(int(tid), -10**9))
+    due_order = sorted(set(due_tids_this), key=_staleness, reverse=True)
+
+    # combine backlog + this frame due, preserving backlog order priority
+    candidates: list[int] = list(scheduler.pending_refresh) + [t for t in due_order if t not in scheduler.pending_refresh]
+
+    # Decide how many we can afford this frame
+    if remaining_ms == float("inf"):
+        k_refresh = len(candidates)
+    else:
+        # estimate how many will fit
+        est_ms = max(0.5, scheduler.ms_per_crop_ema)  # guard
+        k_refresh = int(remaining_ms / est_ms + 1e-6)
+        k_refresh = min(k_refresh, len(candidates))
+
+    if k_refresh > 0 and len(active_snapshot) > 0:
+        # Map chosen tids -> current det indices by IoU to ACTIVE boxes
+        A = np.stack([t.box for t in active_snapshot], axis=0).astype(np.float32)
+        # IoU(A, boxes)
+        x11, y11, x12, y12 = A[:,0][:,None], A[:,1][:,None], A[:,2][:,None], A[:,3][:,None]
+        B = boxes.astype(np.float32)
+        x21, y21, x22, y22 = B[:,0][None,:], B[:,1][None,:], B[:,2][None,:], B[:,3][None,:]
+        inter_w = np.maximum(0, np.minimum(x12, x22) - np.maximum(x11, x21))
+        inter_h = np.maximum(0, np.minimum(y12, y22) - np.maximum(y11, y21))
+        inter = inter_w * inter_h
+        area_a = (x12 - x11) * (y12 - y11)
+        area_b = (x22 - x21) * (y22 - y21)
+        I = inter / (area_a + area_b - inter + 1e-6)  # (T,N)
+
+        best_det_for_tid: dict[int, int] = {}
+        for det_j in range(N):
+            trk_i = int(I[:, det_j].argmax()) if I.shape[0] else 0
+            tid = int(active_snapshot[trk_i].tid)
+            # keep the highest IoU assignment per tid
+            if (tid not in best_det_for_tid) or (I[trk_i, det_j] > I[trk_i, best_det_for_tid[tid]]):
+                best_det_for_tid[tid] = det_j
+
+        chosen_tids = []
+        idx_refresh = []
+        for tid in candidates:
+            if len(chosen_tids) >= k_refresh:
+                break
+            j = best_det_for_tid.get(int(tid), None)
+            if j is None:
+                continue
+            if j in idx_crit:
+                continue  # already computed
+            if j in idx_refresh:
+                continue
+            chosen_tids.append(int(tid))
+            idx_refresh.append(int(j))
+
+        if len(idx_refresh) > 0:
+            t2 = perf_counter()
+            embs_ref = embedder.embed_crops(frame, boxes[np.array(idx_refresh, dtype=int)])
+            embs[np.array(idx_refresh, dtype=int)] = embs_ref
+            batch_ms = (perf_counter() - t2) * 1000.0
+            scheduler.update_ema_ms_per_crop(batch_ms, len(idx_refresh))
+            scheduler.stat_real += len(idx_refresh)
+            refreshed_tids |= scheduler.mark_refreshed(active_snapshot, boxes, np.array(idx_refresh, dtype=int), frame_idx)
+
+            # Remove chosen tids from backlog; keep the rest for next frame
+            scheduler._remove_pending(chosen_tids)
+
+    # Anything not processed stays in scheduler.pending_refresh automatically
     return embs, (perf_counter() - t0), refreshed_tids
 
 
@@ -189,7 +271,10 @@ def main():
             boxes, confs, clses = boxes[m], confs[m], clses[m]
 
         # --- EMBED ---
-        embs, t_emb, refreshed_tids = compute_embeddings(frame, boxes, embedder, tracker, sched, frame_idx)
+        
+        embs, t_emb, refreshed_tids = compute_embeddings(
+            frame, boxes, embedder, tracker, sched, frame_idx, budget_ms=args.embed_budget_ms
+        )
 
         # --- TRACK ---
         t = perf_counter()
