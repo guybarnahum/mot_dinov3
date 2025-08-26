@@ -21,6 +21,39 @@ Progress bar + per-stage timing stats built-in. **Embedding scheduler** reduces 
 
 ---
 
+## 🔄 How embedding compute adapts to detection load
+
+The embedding step automatically **scales with scene complexity**:
+
+* **Fewer detections ⇒ fewer candidates.**
+  Only current detections are considered for embeddings. With fewer boxes, there are naturally fewer critical needs and fewer refresh candidates, so the embedding time drops.
+
+* **Critical vs. Refresh (scheduler behavior).**
+
+  * **Critical** = must compute **now** (ignores budget): new objects, weak IoU continuity, or crowded overlaps (see `--embed-iou-gate`, `--embed-overlap-thr`).
+  * **Refresh** = nice-to-have, done **within `--embed-budget-ms`** to keep features fresh (default every `--embed-refresh` frames). When the budget is tight, refreshes defer to a **backlog** (oldest first).
+
+* **Backlog drains in easy frames.**
+  If previous frames deferred refreshes, the scheduler uses “extra” time in later, lighter frames (fewer detections) to **catch up**—still honoring the per-frame budget.
+
+* **Strict budgeting for refresh.**
+  Refresh work is admitted **incrementally** (one-by-one or tiny chunks) against the **live** per-crop EMA. CUDA is synchronized around timing so the step won’t overshoot `--embed-budget-ms`.
+
+* **What you’ll see in practice.**
+
+  * Sparse scenes: many detections **reuse** cached embeddings → `emb` time hovers near **0–few ms**; occasional `*` marks when a refresh fits the budget.
+  * Busy scenes: more **critical** work → `emb` can exceed the budget (by design) to keep IDs stable, while refreshes are throttled.
+
+**Tuning knobs**
+
+* Budget: `--embed-budget-ms 20` (caps **refresh** work per frame; 0 = unlimited)
+* Refresh rate: `--embed-refresh 5` (lower = more frequent refreshes)
+* Reuse strictness: `--embed-iou-gate 0.6` (higher = reuse only with stronger IoU continuity)
+* Crowding sensitivity: `--embed-overlap-thr 0.2` (lower = more scenes treated as crowded ⇒ more critical embeds)
+
+> Tip: Tracks that had a **real embedding computed this frame** are labeled `ID <tid> *` in the video, so you can visually verify when compute happens.
+
+---
 ## 📦 Install
 
 Clone the repo, then choose one of the variants below.
