@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mot-dinov3"
+version = "0.1.0"
+description = "DINOv3 embeddings + tracking-by-detection"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{name = "You"}]
+
+# Base deps (no torch here—handled by extras below)
+
+dependencies = [
+  "ultralytics>=8.2.0",
+  "transformers>=4.42.0",
+  "huggingface-hub>=0.23.0",
+  "pillow>=10.3.0",
+  "opencv-python>=4.9.0.80,<5",
+  "numpy>=1.26.4,<2.0",
+  "scipy>=1.11,<1.13",
+  "tqdm>=4.66",
+  "safetensors>=0.4.3",
+  "accelerate>=0.31.0",
+  "python-dotenv>=1.0.1"
+]
+
+# Install variants
+[project.optional-dependencies]
+# CPU wheels live under the PyTorch "cpu" index; we install them via setup.sh
+cpu = [
+  "torch==2.2.2",
+  "torchvision==0.17.2"
+]
+
+# T4 GPU: CUDA wheels (default channel cu124 in setup.sh; override if needed)
+t4_gpu = [
+  "torch==2.4.2",
+  "torchvision==0.19.1"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
