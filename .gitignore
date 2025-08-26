@@ -36,7 +36,6 @@ logs/
 
 # Env & secrets
 .env
-.env.*
 
 # Data & outputs (keep placeholders if needed)
 outputs/*
