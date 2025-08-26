@@ -199,6 +199,3 @@ Please follow their respective licenses and gating terms (e.g., Meta’s DINOv3)
 * Meta AI: DINOv3 / DINOv2
 * Ultralytics: YOLO
 * Hugging Face: Transformers & Hub
-
-```
-
