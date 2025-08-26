@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Set
 import numpy as np
 
 # Optional Hungarian; we fall back to greedy if SciPy isn't present.
@@ -63,30 +63,61 @@ class Track:
     tid: int
     box: np.ndarray                 # (4,) xyxy
     emb: np.ndarray                 # (D,) L2-normalized
-    cls: Optional[int] = None
+    cls: Optional[int] = None       # stable/majority class (for display)
     hits: int = 1
     age: int = 1
     time_since_update: int = 0
     state: str = "active"           # "active" | "lost" | "removed"
-    alpha: float = 0.9              # EMA factor for embeddings
+    alpha: float = 0.9              # EMA factor base for embeddings
     gallery: List[np.ndarray] = field(default_factory=list)
     gallery_max: int = 10
 
-    def update(self, box: np.ndarray, emb: np.ndarray):
-        """Update track with a new detection + embedding; EMA + bounded gallery."""
+    # New: class stability & bookkeeping
+    cls_hist: Dict[int, float] = field(default_factory=dict)  # exponential votes
+    last_conf: float = 0.0
+
+    def update(self, box: np.ndarray, emb: np.ndarray,
+               det_conf: float = 1.0, det_cls: Optional[int] = None,
+               conf_min_update: float = 0.3, conf_update_weight: float = 0.5):
+        """
+        Update track with a new detection + embedding.
+        - Embedding EMA is confidence-weighted: stronger update when det_conf is high.
+        - Class histogram gets confidence-weighted votes; self.cls becomes majority class.
+        """
         self.box = box.astype(np.float32)
-        # EMA on embedding (keep normalized)
-        x = self.alpha * self.emb + (1.0 - self.alpha) * emb
-        n = np.linalg.norm(x) + 1e-12
-        self.emb = (x / n).astype(np.float32)
-        # gallery (append raw embedding)
-        self.gallery.append(emb.astype(np.float32).copy())
-        if len(self.gallery) > self.gallery_max:
-            self.gallery.pop(0)
+
+        # Confidence-weighted EMA on embedding (keep normalized)
+        # Effective beta in [0, 1]: larger when more confident.
+        det_conf = float(np.clip(det_conf, 0.0, 1.0))
+        if det_conf >= conf_min_update:
+            beta = (1.0 - self.alpha)
+            beta *= (conf_update_weight * det_conf + (1.0 - conf_update_weight))
+            x = (1.0 - beta) * self.emb + beta * emb
+            n = np.linalg.norm(x) + 1e-12
+            self.emb = (x / n).astype(np.float32)
+            # gallery (append raw embedding)
+            self.gallery.append(emb.astype(np.float32).copy())
+            if len(self.gallery) > self.gallery_max:
+                self.gallery.pop(0)
+
+            # Class histogram (only if class provided)
+            if det_cls is not None and det_cls >= 0:
+                w = det_conf * 0.6  # internal smoothing; tuned with cls votes
+                self.cls_hist[det_cls] = self.cls_hist.get(det_cls, 0.0) * (1.0 - w) + w
+                # light decay on others so the majority can change
+                for k in list(self.cls_hist.keys()):
+                    if k != det_cls:
+                        self.cls_hist[k] *= (1.0 - 0.05 * w)
+                        if self.cls_hist[k] < 1e-4:
+                            del self.cls_hist[k]
+                if self.cls_hist:
+                    self.cls = max(self.cls_hist.items(), key=lambda kv: kv[1])[0]
+
         self.hits += 1
         self.time_since_update = 0
         self.age += 1
         self.state = "active"
+        self.last_conf = det_conf
 
     def mark_lost(self):
         self.time_since_update += 1
@@ -103,7 +134,6 @@ class Track:
         Embeddings are assumed L2-normalized.
         """
         best = float(self.emb @ emb)
-        # compare against last up to 5 gallery entries
         for g in self.gallery[-5:]:
             s = float(g @ emb)
             if s > best:
@@ -116,10 +146,11 @@ class SimpleTracker:
     Re-ID capable tracker:
       - Stage 1: ACTIVE ↔ detections, two passes (high-conf then low-conf),
                  cost = w_iou * (1 - IoU) + w_app * (1 - cosine_sim)
+                 (optional IoU-only on low-conf to avoid drifting)
       - Stage 2: LOST ↔ remaining detections using appearance-only + loose center gate
       - Tracks have states: ACTIVE / LOST / REMOVED
-      - Per-track embedding is EMA + small gallery for robustness
-      - Optional class-consistent matching
+      - Per-track embedding is confidence-weighted EMA + small gallery for robustness
+      - Soft class penalty to reduce ID switches on detector class flips
       - Hungarian or greedy association
     """
 
@@ -135,9 +166,22 @@ class SimpleTracker:
         ema_alpha: float = 0.9,
         gallery_size: int = 10,
         use_hungarian: bool = True,
-        class_consistent: bool = True,
-        conf_high: float = 0.5,
-        conf_low: float = 0.1,
+
+        # Class handling:
+        class_consistent: bool = True,    # apply soft class penalty if True
+        class_penalty: float = 0.15,      # additive cost when det class != track.cls
+
+        # Confidence-aware updates:
+        conf_high: float = 0.5,           # high-conf threshold
+        conf_low: float = 0.1,            # low-conf threshold
+        conf_min_update: float = 0.3,     # only update emb/class if det_conf >= this
+        conf_update_weight: float = 0.5,  # scales EMA strength with det_conf
+
+        # Low-conf behavior:
+        low_conf_iou_only: bool = True,   # if True, Stage 1b uses IoU-only cost for low-conf
+                                          # and (implicitly) updates will be suppressed by conf_min_update
+
+        # Re-ID gating:
         center_gate_base: float = 50.0,   # px allowance for re-ID when just lost
         center_gate_slope: float = 10.0,  # grows per frame lost
     ):
@@ -151,9 +195,21 @@ class SimpleTracker:
         self.ema_alpha = float(ema_alpha)
         self.gallery_size = int(gallery_size)
         self.use_hungarian = (use_hungarian and HAS_HUNGARIAN)
+
+        # class handling
         self.class_consistent = bool(class_consistent)
+        self.class_penalty = float(class_penalty)
+
+        # confidence-aware updates
         self.conf_high = float(conf_high)
         self.conf_low = float(conf_low)
+        self.conf_min_update = float(conf_min_update)
+        self.conf_update_weight = float(conf_update_weight)
+
+        # low-conf behavior
+        self.low_conf_iou_only = bool(low_conf_iou_only)
+
+        # re-id gating
         self.center_gate_base = float(center_gate_base)
         self.center_gate_slope = float(center_gate_slope)
 
@@ -167,10 +223,12 @@ class SimpleTracker:
             tid=self._next_id,
             box=box.astype(np.float32),
             emb=emb.astype(np.float32),
-            cls=cls,
+            cls=cls if (cls is not None and cls >= 0) else None,  # initial displayed class
             alpha=self.ema_alpha,
             gallery_max=self.gallery_size,
         )
+        if t.cls is not None:
+            t.cls_hist[t.cls] = 1.0
         self._next_id += 1
         self.tracks.append(t)
         return t
@@ -191,20 +249,26 @@ class SimpleTracker:
             keep.append(t)
         self.tracks = keep
 
-    def _apply_class_mask(self, C: np.ndarray, act_idx: List[int], det_ids: List[int], clses: Optional[np.ndarray]) -> np.ndarray:
-        """Set a very large cost when track.cls and det class disagree."""
-        if clses is None or not self.class_consistent:
+    def _add_soft_class_penalty(self, C: np.ndarray, act_idx: List[int], det_ids: List[int], clses: Optional[np.ndarray]) -> np.ndarray:
+        """
+        Add a soft penalty (additive cost) when detection class != track's stable class (t.cls).
+        This reduces ID switches from detector class flicker without hard-blocking matches.
+        """
+        if clses is None or not self.class_consistent or self.class_penalty <= 0.0:
             return C
-        BIG = 1e6
+        if len(act_idx) == 0 or len(det_ids) == 0:
+            return C
+
+        P = np.zeros_like(C, dtype=np.float32)
         for r, ti in enumerate(act_idx):
-            tcls = self.tracks[ti].cls
+            tcls = self.tracks[ti].cls  # stabilized label
             if tcls is None:
                 continue
             for c, j in enumerate(det_ids):
                 dcls = int(clses[j]) if j < len(clses) else None
                 if dcls is not None and dcls != tcls:
-                    C[r, c] = BIG
-        return C
+                    P[r, c] = 1.0
+        return C + self.class_penalty * P
 
     def _associate_active(
         self,
@@ -213,37 +277,48 @@ class SimpleTracker:
         boxes: np.ndarray,
         embs: np.ndarray,
         clses: Optional[np.ndarray],
+        confs: Optional[np.ndarray],
         iou_gate: float,
-    ) -> Tuple[set[int], set[int]]:
+        use_iou_only: bool = False,
+    ) -> Tuple[Set[int], Set[int]]:
         """
         Associate ACTIVE tracks with a subset of detections (det_ids).
         Returns (unmatched_det_ids, unmatched_track_indices).
         """
-        unmatched_dets = set(det_ids)
-        unmatched_tracks = set(act_idx)
+        unmatched_dets: Set[int] = set(det_ids)
+        unmatched_tracks: Set[int] = set(act_idx)
         if len(act_idx) == 0 or len(det_ids) == 0:
             return unmatched_dets, unmatched_tracks
 
         A = np.stack([self.tracks[i].box for i in act_idx], axis=0).astype(np.float32)
         B = boxes[det_ids].astype(np.float32)
-        I = iou_xyxy(A, B)                         # (T,N)
-        Aemb = np.stack([self.tracks[i].emb for i in act_idx], axis=0).astype(np.float32)
-        C_app = cosine_dist(Aemb, embs[det_ids])   # (T,N)
-        C = self.iou_w * (1.0 - I) + self.app_w * C_app
-        C = self._apply_class_mask(C, act_idx, det_ids, clses)
+        I = iou_xyxy(A, B)  # (T,N)
 
-        # Hard IoU gating for temporal continuity
-        # (Optionally, we could set a floor; here we leave cost as-is, relying on combined score.)
-        # To *enforce* the gate strictly, uncomment the next line:
-        # C[I < iou_gate] = 1e6
+        if use_iou_only:
+            C = (1.0 - I)
+        else:
+            Aemb = np.stack([self.tracks[i].emb for i in act_idx], axis=0).astype(np.float32)
+            C_app = cosine_dist(Aemb, embs[det_ids])   # (T,N)
+            C = self.iou_w * (1.0 - I) + self.app_w * C_app
+
+        # Soft class penalty (if enabled)
+        C = self._add_soft_class_penalty(C, act_idx, det_ids, clses)
 
         if self.use_hungarian:
             rows, cols = linear_sum_assignment(C)
             for r, c in zip(rows, cols):
                 ti = act_idx[r]
                 j = det_ids[c]
-                # Basic acceptance; you can add additional gates here if needed
-                self.tracks[ti].update(B[c], embs[j])
+                det_conf = float(confs[j]) if confs is not None and j < len(confs) else 1.0
+                det_cls  = int(clses[j]) if clses is not None and j < len(clses) else None
+                # Update; internal logic will suppress embed/class updates if det_conf is low
+                self.tracks[ti].update(
+                    B[c], embs[j],
+                    det_conf=det_conf,
+                    det_cls=det_cls,
+                    conf_min_update=self.conf_min_update,
+                    conf_update_weight=self.conf_update_weight,
+                )
                 unmatched_dets.discard(j)
                 unmatched_tracks.discard(ti)
         else:
@@ -256,7 +331,15 @@ class SimpleTracker:
                     continue
                 ti = act_idx[r]
                 j = det_ids[c]
-                self.tracks[ti].update(B[c], embs[j])
+                det_conf = float(confs[j]) if confs is not None and j < len(confs) else 1.0
+                det_cls  = int(clses[j]) if clses is not None and j < len(clses) else None
+                self.tracks[ti].update(
+                    B[c], embs[j],
+                    det_conf=det_conf,
+                    det_cls=det_cls,
+                    conf_min_update=self.conf_min_update,
+                    conf_update_weight=self.conf_update_weight,
+                )
                 used_r.add(r); used_c.add(c)
                 unmatched_dets.discard(j)
                 unmatched_tracks.discard(ti)
@@ -277,7 +360,7 @@ class SimpleTracker:
 
         det_boxes: (N,4) XYXY
         det_embs : (N,D) L2-normalized embeddings
-        confs    : (N,) optional detector confidences
+        confs    : (N,) optional detector confidences in [0,1]
         clses    : (N,) optional detector class ids
 
         Returns ACTIVE tracks (draw these). LOST tracks are kept internally for re-ID.
@@ -293,15 +376,17 @@ class SimpleTracker:
             hi_ids = [i for i, c in enumerate(confs) if c >= self.conf_high]
             lo_ids = [i for i, c in enumerate(confs) if self.conf_low <= c < self.conf_high]
 
-        # Stage 1: ACTIVE ↔ high-confidence detections
+        # Stage 1: ACTIVE ↔ high-confidence detections (IoU+appearance)
         act_idx = self._active_tracks()
         unmatched_hi, unmatched_tracks = self._associate_active(
-            act_idx, hi_ids, det_boxes, det_embs, clses, self.iou_thresh
+            act_idx, hi_ids, det_boxes, det_embs, clses, confs, self.iou_thresh, use_iou_only=False
         )
 
         # Stage 1b: ACTIVE ↔ low-confidence detections
+        # Optionally IoU-only (to avoid drifting embeddings/classes on weak boxes)
         unmatched_lo, unmatched_tracks = self._associate_active(
-            list(unmatched_tracks), lo_ids, det_boxes, det_embs, clses, self.iou_thresh_low
+            list(unmatched_tracks), lo_ids, det_boxes, det_embs, clses, confs, self.iou_thresh_low,
+            use_iou_only=self.low_conf_iou_only
         )
 
         unmatched_dets = set(unmatched_hi) | set(unmatched_lo)
@@ -317,32 +402,28 @@ class SimpleTracker:
         det_left = sorted(list(unmatched_dets))
         lost_idx = self._lost_tracks()
         if len(lost_idx) and len(det_left):
-            # Build cost = 1 - max_sim
             T = len(lost_idx)
             D = len(det_left)
             C = np.ones((T, D), dtype=np.float32)
 
-            # centers & gating radius
             lost_centers = centers_xyxy(np.stack([self.tracks[i].box for i in lost_idx], axis=0))
             det_centers = centers_xyxy(det_boxes[det_left])
 
             for r, ti in enumerate(lost_idx):
                 tr = self.tracks[ti]
-                # allowed center jump grows with time since update
                 allow = self.center_gate_base + self.center_gate_slope * float(tr.time_since_update)
                 for jj, j in enumerate(det_left):
                     # center gate
                     if len(lost_centers) and len(det_centers):
                         if np.linalg.norm(lost_centers[r] - det_centers[jj]) > allow:
-                            C[r, jj] = 1e6  # gated out
+                            C[r, jj] = 1e6
                             continue
                     sim = tr.best_sim(det_embs[j])  # dot in [-1,1], higher=better
                     C[r, jj] = 1.0 - sim
 
-            # Solve assignment
             if self.use_hungarian:
                 rows, cols = linear_sum_assignment(C)
-                taken_dets: set[int] = set()
+                taken_dets: Set[int] = set()
                 for r, c in zip(rows, cols):
                     sim = 1.0 - C[r, c]
                     if sim < self.reid_sim_thresh:
@@ -351,11 +432,18 @@ class SimpleTracker:
                     j = det_left[c]
                     if j in taken_dets:
                         continue
-                    self.tracks[ti].update(det_boxes[j], det_embs[j])
+                    det_conf = float(confs[j]) if confs is not None and j < len(confs) else 1.0
+                    det_cls  = int(clses[j]) if clses is not None and j < len(clses) else None
+                    self.tracks[ti].update(
+                        det_boxes[j], det_embs[j],
+                        det_conf=det_conf,
+                        det_cls=det_cls,
+                        conf_min_update=self.conf_min_update,
+                        conf_update_weight=self.conf_update_weight,
+                    )
                     taken_dets.add(j)
                     unmatched_dets.discard(j)
             else:
-                # Greedy on appearance cost
                 order = np.argsort(C, axis=None)
                 used_r, used_c = set(), set()
                 for flat in order:
@@ -367,7 +455,15 @@ class SimpleTracker:
                         continue
                     ti = lost_idx[r]
                     j = det_left[c]
-                    self.tracks[ti].update(det_boxes[j], det_embs[j])
+                    det_conf = float(confs[j]) if confs is not None and j < len(confs) else 1.0
+                    det_cls  = int(clses[j]) if clses is not None and j < len(clses) else None
+                    self.tracks[ti].update(
+                        det_boxes[j], det_embs[j],
+                        det_conf=det_conf,
+                        det_cls=det_cls,
+                        conf_min_update=self.conf_min_update,
+                        conf_update_weight=self.conf_update_weight,
+                    )
                     used_r.add(r); used_c.add(c)
                     unmatched_dets.discard(j)
 

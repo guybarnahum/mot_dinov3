@@ -35,6 +35,18 @@ def parse_args():
     ap.add_argument("--cpu", action="store_true", help="Force CPU")
     ap.add_argument("--no-hungarian", action="store_true", help="Use greedy assignment instead of Hungarian")
 
+    ap.add_argument("--class-penalty", type=float, default=0.15, help="Additive cost if det class != track stable class")
+    ap.add_argument("--conf-high", type=float, default=0.5, help="High-confidence threshold for Stage-1")
+    ap.add_argument("--conf-low", type=float, default=0.1, help="Low-confidence threshold for Stage-1b")
+    ap.add_argument("--conf-min-update", type=float, default=0.3, help="Only update emb/class when det_conf >= this")
+    ap.add_argument("--conf-update-weight", type=float, default=0.5, help="EMA strength scaling with det_conf (0..1)")
+    ap.add_argument("--low-conf-iou-only", action="store_true", default=True, help="Use IoU-only cost for low-conf pass to avoid drift")
+    ap.add_argument("--reid-sim-thr", type=float, default=0.6, help="Appearance similarity threshold to revive LOST")
+    ap.add_argument("--max-age", type=int, default=30, help="Frames before ACTIVE becomes LOST")
+    ap.add_argument("--reid-max-age", type=int, default=60, help="Frames to keep LOST before pruning")
+    ap.add_argument("--center-gate-base", type=float, default=50.0, help="Re-ID center gate base radius (px)")
+    ap.add_argument("--center-gate-slope", type=float, default=10.0, help="Gate growth per frame lost (px/frame)")
+
     ap.add_argument("--embedder", type=str, default="dino", help="Embedding backend: dino (default), clip, resnet, ...")
     ap.add_argument("--embed-model", type=str, default="facebook/dinov3-vitb16-pretrain-lvd1689m",
                     help="Embedding model id/name for the chosen embedder")
@@ -229,7 +241,27 @@ def main():
         pad=args.crop_pad, square=args.crop_square
     )
 
-    tracker = SimpleTracker(use_hungarian=not args.no_hungarian)
+    tracker = SimpleTracker(
+        iou_weight=0.3,
+        app_weight=0.7,
+        iou_thresh=0.3,
+        iou_thresh_low=0.2,
+        reid_sim_thresh=args.reid_sim_thr,
+        max_age=args.max_age,
+        reid_max_age=args.reid_max_age,
+        ema_alpha=0.9,
+        gallery_size=10,
+        use_hungarian=not args.no_hungarian,
+        class_consistent=True,
+        class_penalty=args.class_penalty,
+        conf_high=args.conf_high,
+        conf_low=args.conf_low,
+        conf_min_update=args.conf_min_update,
+        conf_update_weight=args.conf_update_weight,
+        low_conf_iou_only=args.low_conf_iou_only,
+        center_gate_base=args.center_gate_base,
+        center_gate_slope=args.center_gate_slope,
+    )
 
     sched = EmbeddingScheduler(SchedulerConfig(
         overlap_thr=args.embed_overlap_thr,

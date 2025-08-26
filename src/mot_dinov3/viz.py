@@ -90,9 +90,14 @@ def draw_tracks(frame: np.ndarray,
         color = _id_to_color(int(t.tid))
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness, cv2.LINE_AA)
 
-        label = f"ID {int(t.tid)}"
-        if int(t.tid) in mark_tids:
+        label = f"ID {t.tid}"
+        if getattr(t, "cls", None) is not None:
+            label += f" (c{int(t.cls)})"   # or map id -> class name if you have a list
+
+        # if you already mark embed-computed tracks with a star:
+        if star_ids is not None and t.tid in star_ids:
             label += " *"
+
         if hasattr(t, "cls") and t.cls is not None:
             label += f" | c{int(t.cls)}"
         if state != "active":
