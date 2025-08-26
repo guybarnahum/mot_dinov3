@@ -84,5 +84,22 @@ class EmbeddingScheduler:
             reuse_tid[j] = tid
         return need_mask, reuse_tid, active
 
-    def mark_refreshed(self, active_snapshot: list, boxes: np.ndarray, idx_need:_
+    def mark_refreshed(self, active_snapshot: list, boxes: np.ndarray, idx_need: np.ndarray, frame_idx: int):
+        """
+        After computing real embeddings for detections idx_need (on the same frame),
+        assign those refreshes to the most plausible ACTIVE track by IoU to its *current* box.
+        """
+        if len(idx_need) == 0 or len(active_snapshot) == 0:
+            return
+        A = np.stack([t.box for t in active_snapshot], axis=0).astype(np.float32)
+        I = _iou_xyxy(A, boxes)  # (T,N)
+        best_idx = I.argmax(axis=0)
+        for j in idx_need:
+            tid = int(active_snapshot[best_idx[j]].tid)
+            self.last_embed_frame[tid] = frame_idx
 
+    def summary(self, frames: int) -> str:
+        if frames <= 0:
+            return "Embeddings computed: 0 total (0.00/frame), reused: 0"
+        per_frame = self.stat_real / frames
+        return f"Embeddings computed: {self.stat_real} total ({per_frame:.2f}/frame), reused: {self.stat_reuse}"
