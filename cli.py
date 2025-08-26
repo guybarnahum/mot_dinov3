@@ -12,11 +12,12 @@ from mot_dinov3 import compat
 compat.apply(strict_numpy=False, quiet=True)
 
 from mot_dinov3.detector import Detector
-from mot_dinov3.embedder import DinoV3Embedder, GatedModelAccessError
+from mot_dinov3.embedder import GatedModelAccessError
 from mot_dinov3.features.factory import create_extractor
 from mot_dinov3.tracker import SimpleTracker
 from mot_dinov3.scheduler import EmbeddingScheduler, SchedulerConfig
 from mot_dinov3.viz import draw_tracks
+
 
 def parse_args():
     ap = argparse.ArgumentParser(description="DINOv3-based MOT (tracking-by-detection)")
@@ -39,7 +40,7 @@ def parse_args():
                     help="Embedding model id/name for the chosen embedder")
 
     ap.add_argument("--crop-pad", type=float, default=0.12, help="Padding ratio around det box for embeddings")
-    ap.add_argument("--crop-square", action="store_true", default=True,help="Use square crops for embeddings (default on)")
+    ap.add_argument("--crop-square", action="store_true", default=True, help="Use square crops for embeddings (default on)")
 
     ap.add_argument("--embed-refresh", type=int, default=5, help="Refresh real embedding every N frames")
     ap.add_argument("--embed-iou-gate", type=float, default=0.6, help="IoU ≥ gate → treat as stable candidate")
@@ -55,6 +56,51 @@ def parse_args():
 
 def _fmt_ms(s):  # seconds -> "xx.x ms"
     return f"{s * 1000:.1f} ms"
+
+
+# --- NEW: one helper that handles plan→reuse→compute→mark and timing ---
+def compute_embeddings(frame: np.ndarray,
+                       boxes: np.ndarray,
+                       embedder,
+                       tracker,
+                       scheduler: EmbeddingScheduler,
+                       frame_idx: int) -> tuple[np.ndarray, float]:
+    """
+    Returns:
+      embs: (N,D) float32
+      t_emb: seconds spent in the embedding step (planning+compute+mark)
+    Side-effects:
+      - updates scheduler.stat_real / scheduler.stat_reuse
+      - updates scheduler.last_embed_frame via mark_refreshed()
+    """
+    t0 = perf_counter()
+
+    N = len(boxes)
+    D = int(getattr(embedder, "emb_dim", 768))
+    if N == 0:
+        return np.zeros((0, D), dtype=np.float32), 0.0
+
+    need_mask, reuse_tids, active_snapshot = scheduler.plan(tracker, boxes, frame_idx)
+
+    embs = np.zeros((N, D), dtype=np.float32)
+
+    # Reuse from ACTIVE tracks when allowed
+    if len(active_snapshot):
+        tid2emb = {int(t.tid): t.emb for t in active_snapshot}
+        for j, tid in enumerate(reuse_tids):
+            if tid is not None and tid in tid2emb:
+                embs[j] = tid2emb[tid]
+                scheduler.stat_reuse += 1
+
+    # Compute only for the subset we need
+    idx_need = np.nonzero(need_mask)[0]
+    if len(idx_need) > 0:
+        embs_need = embedder.embed_crops(frame, boxes[idx_need])
+        embs[idx_need] = embs_need
+        scheduler.stat_real += len(idx_need)
+        scheduler.mark_refreshed(active_snapshot, boxes, idx_need, frame_idx)
+
+    return embs, (perf_counter() - t0)
 
 
 def main():
@@ -80,10 +126,12 @@ def main():
 
     # Init modules
     detector = Detector(args.det, device=device, imgsz=args.imgsz)
-    
-    embedder = create_extractor(args.embedder, args.embed_model, device, autocast=(device=="cuda"),
-                            pad=args.crop_pad, square=args.crop_square)
-                           
+
+    embedder = create_extractor(
+        args.embedder, args.embed_model, device, autocast=(device == "cuda"),
+        pad=args.crop_pad, square=args.crop_square
+    )
+
     tracker = SimpleTracker(use_hungarian=not args.no_hungarian)
 
     sched = EmbeddingScheduler(SchedulerConfig(
@@ -109,16 +157,18 @@ def main():
     # Timers / stats
     t_start = perf_counter()
     frames = 0
+    frame_idx = 0  # <-- needed by the scheduler
     ema_fps = None
     alpha = 0.15  # smoothing for FPS
 
     # Stage accumulators (seconds)
     acc_read = acc_det = acc_emb = acc_track = acc_draw = acc_write = 0.0
     acc_frame = 0.0
-    frame_times = []  # per-frame total time, for p50/p95
+    frame_times: list[float] = []  # per-frame total time (seconds) for p50/p95
 
     while True:
         f0 = perf_counter()
+
         # --- READ ---
         t = perf_counter()
         ok, frame = cap.read()
@@ -136,42 +186,16 @@ def main():
             m = np.array([c in keep_ids for c in clses], dtype=bool)
             boxes, confs, clses = boxes[m], confs[m], clses[m]
 
-        # --- EMBED ---
-        t = perf_counter()
+        # --- EMBED (via helper) ---
+        embs, t_emb = compute_embeddings(frame, boxes, embedder, tracker, sched, frame_idx)
 
-        # embs = embedder.embed_crops(frame, boxes, pad_ratio=args.crop_pad, square=args.crop_square)
-        # Decide which detections need real embeddings
-        need_mask, reuse_tids, active_snapshot = sched.plan(tracker, boxes, frame_idx)
-
-        # Prepare embedding array
-        embs = np.zeros((len(boxes), getattr(embedder, "emb_dim", 768)), dtype=np.float32)
-
-        # Reuse cached embeddings where allowed
-        if len(active_snapshot):
-            tid2emb = {int(t.tid): t.emb for t in active_snapshot}
-            for j, tid in enumerate(reuse_tids):
-                if tid is not None:
-                    embs[j] = tid2emb[tid]
-                    sched.stat_reuse += 1
-
-        # Compute real embeddings only for needed subset
-        idx_need = np.nonzero(need_mask)[0]
-        if len(idx_need) > 0:
-            embs_need = embedder.embed_crops(frame, boxes[idx_need])
-            embs[idx_need] = embs_need
-            sched.stat_real += len(idx_need)
-            # mark refresh timestamps for the matched tracks (IoU to active snapshot)
-            sched.mark_refreshed(active_snapshot, boxes, idx_need, frame_idx)
-
-        t_emb = perf_counter() - t
-
-        # --- TRACK + DRAW ---
+        # --- TRACK ---
         t = perf_counter()
         tracks = tracker.update(boxes, embs, confs=confs, clses=clses)
         t_track = perf_counter() - t
 
+        # --- DRAW ---
         t = perf_counter()
-        # in the frame loop
         draw_tracks(frame, tracks, draw_lost=args.draw_lost, thickness=args.line_thickness, font_scale=args.font_scale)
         t_draw = perf_counter() - t
 
@@ -183,6 +207,7 @@ def main():
         # Totals / stats
         f_dt = perf_counter() - f0
         frames += 1
+        frame_idx += 1  # bump every processed frame
         frame_times.append(f_dt)
         acc_read += t_read
         acc_det += t_det
@@ -240,8 +265,9 @@ def main():
     print(f"  write : {_fmt_ms(acc_write / max(1, frames))} | {pct(acc_write):5.1f}%")
     other = max(0.0, acc_frame - (acc_read + acc_det + acc_emb + acc_track + acc_draw + acc_write))
     print(f"  other : {_fmt_ms(other / max(1, frames))}  | {pct(other):5.1f}%")
-    print(f"Done. Wrote {args.output}. {frames} frames in {time.time()-t0:.1f}s")
+    print(f"Done. Wrote {args.output}. {frames} frames in {elapsed:.1f}s")
     print(sched.summary(frames))
+
 
 if __name__ == "__main__":
     try:
