@@ -36,8 +36,9 @@ cpu = [
 
 # T4 GPU: CUDA wheels (default channel cu124 in setup.sh; override if needed)
 t4_gpu = [
-  "torch==2.4.2",
-  "torchvision==0.19.1"
+  "torch==2.4.1",
+  "torchvision==0.19.1",
+  "torchaudio==2.4.1",
 ]
 
 [tool.setuptools.packages.find]
