@@ -317,79 +317,84 @@ def main():
     acc_read = acc_det = acc_emb = acc_track = acc_draw = acc_write = 0.0
     acc_frame = 0.0
     frame_times: list[float] = []  # per-frame total time (seconds) for p50/p95
+    interrupted = False
 
-    while True:
-        f0 = perf_counter()
+    try:
+        while True:
+            f0 = perf_counter()
 
-        # --- READ ---
-        t = perf_counter()
-        ok, frame = cap.read()
-        t_read = perf_counter() - t
-        if not ok:
-            break
+            # --- READ ---
+            t = perf_counter()
+            ok, frame = cap.read()
+            t_read = perf_counter() - t
+            if not ok:
+                break
 
-        # --- DETECT ---
-        t = perf_counter()
-        boxes, confs, clses = detector.detect(frame, conf_thres=args.conf)
-        t_det = perf_counter() - t
+            # --- DETECT ---
+            t = perf_counter()
+            boxes, confs, clses = detector.detect(frame, conf_thres=args.conf)
+            t_det = perf_counter() - t
 
-        # Optional class filtering
-        if keep_ids is not None and len(boxes) > 0:
-            m = np.array([c in keep_ids for c in clses], dtype=bool)
-            boxes, confs, clses = boxes[m], confs[m], clses[m]
+            # Optional class filtering
+            if keep_ids is not None and len(boxes) > 0:
+                m = np.array([c in keep_ids for c in clses], dtype=bool)
+                boxes, confs, clses = boxes[m], confs[m], clses[m]
 
-        # --- EMBED ---
-        embs, t_emb, refreshed_tids = compute_embeddings(
-            frame, boxes, embedder, tracker, sched, frame_idx, budget_ms=args.embed_budget_ms
-        )
+            # --- EMBED ---
+            embs, t_emb, refreshed_tids = compute_embeddings(
+                frame, boxes, embedder, tracker, sched, frame_idx, budget_ms=args.embed_budget_ms
+            )
 
-        # --- TRACK ---
-        t = perf_counter()
-        tracks = tracker.update(boxes, embs, confs=confs, clses=clses)
-        t_track = perf_counter() - t
+            # --- TRACK ---
+            t = perf_counter()
+            tracks = tracker.update(boxes, embs, confs=confs, clses=clses)
+            t_track = perf_counter() - t
 
-        # --- DRAW ---
-        t = perf_counter()
-        draw_tracks(
-            frame, tracks,
-            draw_lost=args.draw_lost,
-            thickness=args.line_thickness,
-            font_scale=args.font_scale,
-            mark_tids=refreshed_tids   # label gets a "*" if an embed was computed this frame
-        )
-        t_draw = perf_counter() - t
+            # --- DRAW ---
+            t = perf_counter()
+            draw_tracks(
+                frame, tracks,
+                draw_lost=args.draw_lost,
+                thickness=args.line_thickness,
+                font_scale=args.font_scale,
+                mark_tids=refreshed_tids   # label gets a "*" if an embed was computed this frame
+            )
+            t_draw = perf_counter() - t
 
-        # --- WRITE ---
-        t = perf_counter()
-        out.write(frame)
-        t_write = perf_counter() - t
+            # --- WRITE ---
+            t = perf_counter()
+            out.write(frame)
+            t_write = perf_counter() - t
 
-        # Totals / stats
-        f_dt = perf_counter() - f0
-        frames += 1
-        frame_idx += 1
-        frame_times.append(f_dt)
-        acc_read += t_read
-        acc_det += t_det
-        acc_emb += t_emb
-        acc_track += t_track
-        acc_draw += t_draw
-        acc_write += t_write
-        acc_frame += f_dt
+            # Totals / stats
+            f_dt = perf_counter() - f0
+            frames += 1
+            frame_idx += 1
+            frame_times.append(f_dt)
+            acc_read += t_read
+            acc_det += t_det
+            acc_emb += t_emb
+            acc_track += t_track
+            acc_draw += t_draw
+            acc_write += t_write
+            acc_frame += f_dt
 
-        # Live FPS (EMA) and stage timings in postfix
-        inst_fps = 1.0 / max(1e-6, f_dt)
-        ema_fps = inst_fps if ema_fps is None else (1 - alpha) * ema_fps + alpha * inst_fps
-        if frames % 5 == 0:
-            pbar.set_postfix({
-                "fps": f"{ema_fps:.1f}",
-                "det": _fmt_ms(t_det),
-                "emb": _fmt_ms(t_emb),
-                "trk": _fmt_ms(t_track),
-                "draw": _fmt_ms(t_draw),
-            })
+            # Live FPS (EMA) and stage timings in postfix
+            inst_fps = 1.0 / max(1e-6, f_dt)
+            ema_fps = inst_fps if ema_fps is None else (1 - alpha) * ema_fps + alpha * inst_fps
+            if frames % 5 == 0:
+                pbar.set_postfix({
+                    "fps": f"{ema_fps:.1f}",
+                    "det": _fmt_ms(t_det),
+                    "emb": _fmt_ms(t_emb),
+                    "trk": _fmt_ms(t_track),
+                    "draw": _fmt_ms(t_draw),
+                })
 
-        pbar.update(1)
+            pbar.update(1)
+
+    except KeyboardInterrupt:
+        interrupted = True  
 
     # Cleanup
     cap.release()
@@ -409,6 +414,9 @@ def main():
     else:
         p50 = p95 = 0.0
 
+    if interrupted:
+        print("\n^C received — stopping gracefully. Partial output saved.")
+
     print("\n=== Tracking summary ===")
     print(f"Video:          {args.source}  →  {args.output}")
     print(f"Resolution:     {W}x{H} @ {src_fps:.2f} fps (out {fps:.2f} fps)")
@@ -424,9 +432,8 @@ def main():
     print(f"  write : {_fmt_ms(acc_write / max(1, frames))} | {pct(acc_write):5.1f}%")
     other = max(0.0, acc_frame - (acc_read + acc_det + acc_emb + acc_track + acc_draw + acc_write))
     print(f"  other : {_fmt_ms(other / max(1, frames))}  | {pct(other):5.1f}%")
-    print(f"Done. Wrote {args.output}. {elapsed:.1f}s total")
+    print(f"Done. Wrote {args.output}. {'(interrupted)' if interrupted else ''} {elapsed:.1f}s total")
     print(sched.summary(frames))
-
 
 if __name__ == "__main__":
     try:
@@ -435,6 +442,10 @@ if __name__ == "__main__":
         # Belt & suspenders: catch here too, print clean, no traceback
         print(str(e))
         sys.exit(2)
+    except KeyboardInterrupt:
+        # Fallback, in case an early Ctrl-C happens before the main() loop installs its handler
+        print("\n^C received — exiting.")
+        sys.exit(130)
     except Exception as e:
         # No ugly tracebacks unless explicitly requested
         if "--debug" in sys.argv or os.getenv("MOT_DEBUG") == "1":
