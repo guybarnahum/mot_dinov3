@@ -70,7 +70,12 @@ class EmbeddingScheduler:
         s = set(int(t) for t in tids)
         self.pending_refresh = [t for t in self.pending_refresh if t not in s]
 
+    @staticmethod
     def _embedder_device_type(embedder) -> str:
+    """
+    Return 'cuda' or 'cpu' given either a DINOExtractor or a raw embedder.
+    Handles the adapter case where the real embedder is at ._e.
+    """
         dev = getattr(embedder, "device", None)
         if dev is None and hasattr(embedder, "_e"):  # DINOExtractor → DinoV3Embedder
             dev = getattr(embedder._e, "device", None)
@@ -191,7 +196,7 @@ class EmbeddingScheduler:
         t_emb_seconds  : wall time spent here
         refreshed_tids : set of track IDs refreshed now (for UI '*')
         """
-        on_cuda = (_embedder_device_type(embedder) == "cuda")
+        on_cuda = (self._embedder_device_type(embedder) == "cuda")
         if on_cuda:
             torch.cuda.synchronize()
         t0 = perf_counter()

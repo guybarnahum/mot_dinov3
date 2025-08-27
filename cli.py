@@ -79,16 +79,6 @@ def parse_args():
 def _fmt_ms(s: float) -> str:  # seconds -> "xx.x ms"
     return f"{s * 1000:.1f} ms"
 
-
-def _get_embedder_device(embedder) -> str:
-    # DINOExtractor exposes the DinoV3Embedder as ._e; prefer explicit .device if present
-    dev = getattr(embedder, "device", None)
-    if dev is None and hasattr(embedder, "_e"):
-        dev = getattr(embedder._e, "device", None)
-    if isinstance(dev, torch.device):
-        return dev.type
-    return str(dev or "cpu")
-
 def main():
     args = parse_args()
     device = "cpu" if args.cpu else ("cuda" if torch.cuda.is_available() else "cpu")
