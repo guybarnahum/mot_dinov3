@@ -72,10 +72,10 @@ class EmbeddingScheduler:
 
     @staticmethod
     def _embedder_device_type(embedder) -> str:
-    """
-    Return 'cuda' or 'cpu' given either a DINOExtractor or a raw embedder.
-    Handles the adapter case where the real embedder is at ._e.
-    """
+        """
+        Return 'cuda' or 'cpu' given either a DINOExtractor or a raw embedder.
+        Handles the adapter case where the real embedder is at ._e.
+        """
         dev = getattr(embedder, "device", None)
         if dev is None and hasattr(embedder, "_e"):  # DINOExtractor → DinoV3Embedder
             dev = getattr(embedder._e, "device", None)
