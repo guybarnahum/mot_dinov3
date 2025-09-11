@@ -2,7 +2,7 @@
 import os
 import argparse
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from time import perf_counter
 from typing import Dict, List, Tuple
 
@@ -183,7 +183,8 @@ def initialize_components(args: argparse.Namespace, device: str) -> Dict[str, ob
         center_gate_base=args.center_gate_base,
         center_gate_slope=args.center_gate_slope,
     )
-    tracker = SimpleTracker(tracker_params)
+
+    tracker = SimpleTracker(**asdict(tracker_params))
 
     scheduler_params = SchedulerParams(
         overlap_thr=args.embed_overlap_thr,
