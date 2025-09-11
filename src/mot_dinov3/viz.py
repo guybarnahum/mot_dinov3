@@ -61,55 +61,53 @@ def _draw_label(img: np.ndarray, x: int, y: int, text: str,
 
 def draw_tracks(
     frame: np.ndarray,
-    tracks,
+    tracks: list,
     draw_lost: bool = False,
     thickness: int = 2,
     font_scale: float = 0.5,
     mark_tids: set[int] | None = None
-) -> np.ndarray:
+) -> None:
     """
-    Draw colored boxes + 'ID <tid>' labels for tracks.
+    Draws track boxes and labels directly onto the frame (in-place).
 
-    mark_tids:
-        Optional set of track IDs. If a track's ID is in this set, a '*' is appended
-        to the label to indicate the embedding was computed this frame.
+    Args:
+        frame: The image frame to draw on (modified in-place).
+        tracks: A list of track objects to visualize.
+        draw_lost: If True, also draws tracks marked as 'lost'.
+        thickness: Line thickness for the bounding box.
+        font_scale: Font scale for the label text.
+        mark_tids: Set of track IDs to mark with a '*' (e.g., embedded this frame).
     """
-    if tracks is None:
-        return frame
+
+    if not tracks:
+        return
 
     H, W = frame.shape[:2]
     mark_tids = mark_tids or set()
 
     for t in tracks:
         state = getattr(t, "state", "active")
-        if not draw_lost and state != "active":
+        if state != "active" and not draw_lost:
             continue
 
-        # Clamp box
-        x1, y1, x2, y2 = [int(v) for v in t.box]
-        x1 = max(0, min(W - 1, x1)); x2 = max(0, min(W - 1, x2))
-        y1 = max(0, min(H - 1, y1)); y2 = max(0, min(H - 1, y2))
-
-        color = _id_to_color(int(t.tid))
-
-        # Dim color a bit for LOST tracks so it's visually distinct
+        x1, y1, x2, y2 = np.clip(t.box, [0, 0, 0, 0], [W - 1, H - 1, W - 1, H - 1]).astype(int)
+        tid = int(t.tid)
+        color = _id_to_color(tid)
+        
         if state != "active":
             color = tuple(int(c * 0.6) for c in color)
 
-        # Box
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness, cv2.LINE_AA)
 
-        # Label: ID, optional class, star if embedded this frame, and state
-        starred = (t.tid in mark_tids)
-        parts = [f"ID {t.tid}{'*' if starred else ''}"]
-        if getattr(t, "cls", None) is not None:
-            parts.append(f"c{int(t.cls)}")
+        # Build the label string
+        label_parts = [f"ID {tid}{'*' if tid in mark_tids else ''}"]
+        if hasattr(t, "cls") and t.cls is not None:
+            label_parts.append(f"c{int(t.cls)}")
         if state != "active":
-            parts.append("(lost)")
-        label = " | ".join(parts)
-
+            label_parts.append(f"({state})")
+        
+        label = " | ".join(label_parts)
         _draw_label(frame, x1, y1, label, color, font_scale=font_scale, thickness=1)
 
-    return frame
 
 
