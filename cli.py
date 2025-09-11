@@ -1,12 +1,19 @@
-# cli.py
+# cli.py (Refactored)
 import os
-from dotenv import load_dotenv
-load_dotenv()  # pick up HF_TOKEN / HUGGINGFACE_HUB_TOKEN from .env
-
-import argparse, sys
+import argparse
+import sys
+from dataclasses import dataclass
 from time import perf_counter
-import numpy as np, cv2, torch
+from typing import Dict, List, Tuple
+
+import cv2
+import numpy as np
+import torch
+from dotenv import load_dotenv
 from tqdm.auto import tqdm
+
+# Load .env file for HF_TOKEN
+load_dotenv()
 
 from mot_dinov3 import compat
 compat.apply(strict_numpy=False, quiet=True)
@@ -14,303 +21,291 @@ compat.apply(strict_numpy=False, quiet=True)
 from mot_dinov3.detector import Detector
 from mot_dinov3.embedder import GatedModelAccessError
 from mot_dinov3.features.factory import create_extractor
+from mot_dinov3.scheduler import EmbeddingScheduler
 from mot_dinov3.tracker import SimpleTracker
-from mot_dinov3.scheduler import EmbeddingScheduler, SchedulerConfig
 from mot_dinov3.viz import draw_tracks
+
+
+# REFACTOR: Use dataclasses to group component parameters for clarity
+@dataclass
+class SchedulerParams:
+    overlap_thr: float
+    iou_gate: float
+    refresh_every: int
+
+@dataclass
+class TrackerParams:
+    iou_weight: float = 0.3
+    app_weight: float = 0.7
+    iou_thresh: float = 0.3
+    iou_thresh_low: float = 0.2
+    reid_sim_thresh: float = 0.6
+    max_age: int = 30
+    reid_max_age: int = 60
+    ema_alpha: float = 0.9
+    gallery_size: int = 10
+    use_hungarian: bool = True
+    class_consistent: bool = True
+    class_penalty: float = 0.15
+    conf_high: float = 0.5
+    conf_low: float = 0.1
+    conf_min_update: float = 0.3
+    conf_update_weight: float = 0.5
+    low_conf_iou_only: bool = True
+    center_gate_base: float = 50.0
+    center_gate_slope: float = 10.0
+    class_vote_smoothing: float = 0.6
+    class_decay_factor: float = 0.05
+
+@dataclass
+class Stats:
+    frame_times: List[float] = field(default_factory=list)
+    stage_timers: Dict[str, float] = field(default_factory=lambda: {
+        "read": 0.0, "detect": 0.0, "embed": 0.0, 
+        "track": 0.0, "draw": 0.0, "write": 0.0,
+    })
 
 def parse_args():
     ap = argparse.ArgumentParser(description="DINOv3-based MOT (tracking-by-detection)")
-    ap.add_argument("--source", type=str, required=True, help="Path to input video")
-    ap.add_argument("--output", type=str, default="outputs/tracked.mp4", help="Output video path")
-    ap.add_argument("--det", type=str, default="yolov8n.pt", help="Ultralytics model path or name")
+    
+    # REFACTOR: Group arguments for better readability in --help
+    g_io = ap.add_argument_group("I/O")
+    g_io.add_argument("--source", type=str, required=True, help="Path to input video")
+    g_io.add_argument("--output", type=str, default="outputs/tracked.mp4", help="Output video path")
+    g_io.add_argument("--fps", type=float, default=0.0, help="Force output FPS (0 uses source FPS)")
 
-    # legacy / retained for convenience (you'll mostly use --embed-model now)
-    ap.add_argument("--dinov3", type=str, default="facebook/dinov3-vitb16-pretrain-lvd1689m",
-                    help="HF model id (e.g., facebook/dinov3-..., or open: facebook/dinov2-base)")
-    ap.add_argument("--fallback-open", action="store_true",
-                    help="If gated access is denied, automatically fall back to facebook/dinov2-base")
+    g_det = ap.add_argument_group("Detector")
+    g_det.add_argument("--det", type=str, default="yolov8n.pt", help="Ultralytics model path or name")
+    g_det.add_argument("--conf", type=float, default=0.3, help="Detector confidence threshold")
+    g_det.add_argument("--imgsz", type=int, default=960, help="Detector input size")
+    g_det.add_argument("--classes", type=str, default="", help="Comma-separated class ids to keep (optional)")
 
-    ap.add_argument("--conf", type=float, default=0.3, help="Detector confidence threshold")
-    ap.add_argument("--imgsz", type=int, default=960, help="Detector input size")
-    ap.add_argument("--classes", type=str, default="", help="Comma-separated class ids to keep (optional)")
-    ap.add_argument("--fps", type=float, default=0.0, help="Force output FPS (0 uses source FPS)")
-    ap.add_argument("--cpu", action="store_true", help="Force CPU")
-    ap.add_argument("--no-hungarian", action="store_true", help="Use greedy assignment instead of Hungarian")
+    g_emb = ap.add_argument_group("Embedding & Scheduling")
+    g_emb.add_argument("--embedder", type=str, default="dino", help="Embedding backend: dino (default), clip, etc.")
+    g_emb.add_argument("--embed-model", type=str, default="facebook/dinov3-vitb16-pretrain-lvd1689m", help="Embedding model ID")
+    g_emb.add_argument("--dinov3", type=str, help="[DEPRECATED] Use --embed-model instead")
+    g_emb.add_argument("--fallback-open", action="store_true", help="On auth error, fallback to open DINOv2")
+    g_emb.add_argument("--embed-amp", choices=["auto", "fp16", "bf16", "off"], default="auto", help="Autocast dtype")
+    g_emb.add_argument("--crop-pad", type=float, default=0.12, help="Padding ratio for embedding crops")
+    g_emb.add_argument("--crop-square", action="store_true", default=True, help="Use square crops for embeddings")
+    g_emb.add_argument("--embed-budget-ms", type=float, default=0.0, help="Max ms per frame for refresh work (0=unlimited)")
+    g_emb.add_argument("--embed-refresh", type=int, default=5, help="Refresh embedding every N frames")
+    g_emb.add_argument("--embed-iou-gate", type=float, default=0.6, help="IoU ≥ gate → stable candidate")
+    g_emb.add_argument("--embed-overlap-thr", type=float, default=0.2, help="Det-det IoU > thr → crowded")
 
-    # tracker robustness knobs
-    ap.add_argument("--class-penalty", type=float, default=0.15, help="Additive cost if det class != track stable class")
-    ap.add_argument("--conf-high", type=float, default=0.5, help="High-confidence threshold for Stage-1")
-    ap.add_argument("--conf-low", type=float, default=0.1, help="Low-confidence threshold for Stage-1b")
-    ap.add_argument("--conf-min-update", type=float, default=0.3, help="Only update emb/class when det_conf >= this")
-    ap.add_argument("--conf-update-weight", type=float, default=0.5, help="EMA strength scaling with det_conf (0..1)")
-    ap.add_argument("--low-conf-iou-only", action="store_true", default=True,
-                    help="Use IoU-only cost for low-conf pass to avoid drift")
-    ap.add_argument("--reid-sim-thr", type=float, default=0.6, help="Appearance similarity threshold to revive LOST")
-    ap.add_argument("--max-age", type=int, default=30, help="Frames before ACTIVE becomes LOST")
-    ap.add_argument("--reid-max-age", type=int, default=60, help="Frames to keep LOST before pruning")
-    ap.add_argument("--center-gate-base", type=float, default=50.0, help="Re-ID center gate base radius (px)")
-    ap.add_argument("--center-gate-slope", type=float, default=10.0, help="Gate growth per frame lost (px/frame)")
+    g_trk = ap.add_argument_group("Tracker")
+    g_trk.add_argument("--no-hungarian", action="store_true", help="Use greedy instead of Hungarian assignment")
+    g_trk.add_argument("--class-penalty", type=float, default=0.15, help="Cost for class mismatch")
+    g_trk.add_argument("--conf-high", type=float, default=0.5, help="High-confidence detection threshold")
+    g_trk.add_argument("--conf-low", type=float, default=0.1, help="Low-confidence detection threshold")
+    g_trk.add_argument("--conf-min-update", type=float, default=0.3, help="Min confidence to update track embedding")
+    g_trk.add_argument("--conf-update-weight", type=float, default=0.5, help="EMA strength scaling with confidence")
+    g_trk.add_argument("--low-conf-iou-only", action="store_true", default=True, help="Use IoU-only cost for low-conf pass")
+    g_trk.add_argument("--reid-sim-thr", type=float, default=0.6, help="Similarity threshold to revive LOST tracks")
+    g_trk.add_argument("--max-age", type=int, default=30, help="Frames before ACTIVE track becomes LOST")
+    g_trk.add_argument("--reid-max-age", type=int, default=60, help="Frames to keep LOST track before pruning")
+    g_trk.add_argument("--center-gate-base", type=float, default=50.0, help="Re-ID center gate base radius (px)")
+    g_trk.add_argument("--center-gate-slope", type=float, default=10.0, help="Gate growth per frame lost (px/frame)")
 
-    # embedding backend + scheduling
-    ap.add_argument("--embedder", type=str, default="dino", help="Embedding backend: dino (default), clip, resnet, ...")
-    ap.add_argument("--embed-model", type=str, default="facebook/dinov3-vitb16-pretrain-lvd1689m",
-                    help="Embedding model id/name for the chosen embedder")
+    g_viz = ap.add_argument_group("Visualization")
+    g_viz.add_argument("--draw-lost", action="store_true", help="Also draw LOST tracks")
+    g_viz.add_argument("--line-thickness", type=int, default=2, help="BBox line thickness")
+    g_viz.add_argument("--font-scale", type=float, default=0.5, help="Label font scale")
 
-    ap.add_argument("--crop-pad", type=float, default=0.12, help="Padding ratio around det box for embeddings")
-    ap.add_argument("--crop-square", action="store_true", default=True, help="Use square crops for embeddings (default on)")
+    g_sys = ap.add_argument_group("System")
+    g_sys.add_argument("--cpu", action="store_true", help="Force CPU for all operations")
+    g_sys.add_argument("--debug", action="store_true", help="Show full tracebacks for debugging")
 
-    ap.add_argument("--embed-amp", choices=["auto","fp16","bf16","off"], default="auto",
-                    help="Autocast dtype for embeddings: 'auto' chooses bf16 on Ampere+, fp16 on older GPUs.")
-    ap.add_argument("--embed-refresh", type=int, default=5, help="Refresh real embedding every N frames")
-    ap.add_argument("--embed-iou-gate", type=float, default=0.6, help="IoU ≥ gate → treat as stable candidate")
-    ap.add_argument("--embed-overlap-thr", type=float, default=0.2, help="Det-det IoU > thr marks crowded")
-    ap.add_argument("--embed-budget-ms", type=float, default=0.0,
-                    help="Max ms per frame for embedding work (0 = unlimited). Budget applies to refresh work only.")
+    args = ap.parse_args()
+    
+    # REFACTOR: Handle legacy --dinov3 argument gracefully
+    if args.dinov3:
+        print("[WARNING] --dinov3 is deprecated. Please use --embed-model instead.")
+        # Only override if the new argument was not explicitly set
+        if args.embed_model == ap.get_default("embed_model"):
+            args.embed_model = args.dinov3
 
-    # draw
-    ap.add_argument("--draw-lost", action="store_true", help="Also draw LOST tracks")
-    ap.add_argument("--line-thickness", type=int, default=2, help="BBox line thickness")
-    ap.add_argument("--font-scale", type=float, default=0.5, help="Label font scale")
+    return args
 
-    ap.add_argument("--debug", action="store_true", help="Show full tracebacks for debugging")
-    return ap.parse_args()
+def setup_video_io(source_path: str, output_path: str, fps_override: float) -> Tuple[cv2.VideoCapture, cv2.VideoWriter, dict]:
+    """Initializes video capture and writer objects."""
+    cap = cv2.VideoCapture(source_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video source: {source_path}")
 
-
-def _fmt_ms(s: float) -> str:  # seconds -> "xx.x ms"
-    return f"{s * 1000:.1f} ms"
-
-def main():
-    args = parse_args()
-    device = "cpu" if args.cpu else ("cuda" if torch.cuda.is_available() else "cpu")
-
-    out_dir = os.path.dirname(args.output)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-
-    cap = cv2.VideoCapture(args.source)
-    assert cap.isOpened(), f"Could not open {args.source}"
-
-    W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    fps = args.fps if args.fps > 0 else src_fps
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    if total_frames <= 0 or total_frames > 1_000_000_000:
-        total_frames = None  # unknown or bogus
+    meta = {
+        "width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+        "height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+        "src_fps": cap.get(cv2.CAP_PROP_FPS) or 30.0,
+        "total_frames": int(cap.get(cv2.CAP_PROP_FRAME_COUNT)),
+    }
+    meta["out_fps"] = fps_override if fps_override > 0 else meta["src_fps"]
+    if meta["total_frames"] <= 0: meta["total_frames"] = None
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out = cv2.VideoWriter(args.output, fourcc, fps, (W, H))
-    if not out.isOpened():
-        raise RuntimeError(f"Could not open writer for {args.output}")
+    out_dir = os.path.dirname(output_path)
+    if out_dir: os.makedirs(out_dir, exist_ok=True)
+    
+    writer = cv2.VideoWriter(output_path, fourcc, meta["out_fps"], (meta["width"], meta["height"]))
+    if not writer.isOpened():
+        raise RuntimeError(f"Could not open video writer for: {output_path}")
+        
+    return cap, writer, meta
 
-    # Init modules
-    detector = Detector(args.det, device=device, imgsz=args.imgsz)
+def initialize_components(args: argparse.Namespace, device: str) -> Dict[str, object]:
+    """Initializes all the main processing modules."""
+    # REFACTOR: Detector no longer needs a device argument
+    detector = Detector(args.det, imgsz=args.imgsz)
 
-    amp = args.embed_amp
-    if amp == "auto":
-        if torch.cuda.is_available():
-            cc = torch.cuda.get_device_capability(0)
-            amp = "bf16" if cc[0] >= 8 else "fp16"  # Ampere+ -> bf16, Turing (T4) -> fp16
-        else:
-            amp = "off"
+    if args.embed_amp == "auto":
+        amp_dtype = "bf16" if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8 else "fp16"
+    else:
+        amp_dtype = args.embed_amp if args.embed_amp != "off" else None
 
     embedder = create_extractor(
         args.embedder, args.embed_model, device,
-        autocast=(device == "cuda"),
-        amp_dtype=("fp16" if amp == "fp16" else "bf16" if amp == "bf16" else None),
+        autocast=(device == "cuda"), amp_dtype=amp_dtype,
         pad=args.crop_pad, square=args.crop_square
     )
-
-    tracker = SimpleTracker(
-        iou_weight=0.3,
-        app_weight=0.7,
-        iou_thresh=0.3,
-        iou_thresh_low=0.2,
-        reid_sim_thresh=args.reid_sim_thr,
-        max_age=args.max_age,
-        reid_max_age=args.reid_max_age,
-        ema_alpha=0.9,
-        gallery_size=10,
+    
+    # REFACTOR: Use dataclass to configure the tracker
+    tracker_params = TrackerParams(
         use_hungarian=not args.no_hungarian,
-        class_consistent=True,
         class_penalty=args.class_penalty,
         conf_high=args.conf_high,
         conf_low=args.conf_low,
         conf_min_update=args.conf_min_update,
         conf_update_weight=args.conf_update_weight,
         low_conf_iou_only=args.low_conf_iou_only,
+        reid_sim_thresh=args.reid_sim_thr,
+        max_age=args.max_age,
+        reid_max_age=args.reid_max_age,
         center_gate_base=args.center_gate_base,
         center_gate_slope=args.center_gate_slope,
     )
+    tracker = SimpleTracker(tracker_params)
 
-    sched = EmbeddingScheduler(SchedulerConfig(
+    scheduler_params = SchedulerParams(
         overlap_thr=args.embed_overlap_thr,
         iou_gate=args.embed_iou_gate,
         refresh_every=args.embed_refresh,
-    ))
-
-    keep_ids = None
-    if args.classes.strip():
-        keep_ids = set(int(x) for x in args.classes.split(",") if x.strip().isdigit())
-
-    # Progress bar
-    pbar = tqdm(
-        total=total_frames,
-        unit="frame",
-        dynamic_ncols=True,
-        desc=f"Tracking [{device}]",
-        disable=not sys.stderr.isatty(),
-        leave=True,
     )
+    scheduler = EmbeddingScheduler(scheduler_params)
+    
+    return {"detector": detector, "embedder": embedder, "tracker": tracker, "scheduler": scheduler}
 
-    # Timers / stats
-    t_start = perf_counter()
-    frames = 0
-    frame_idx = 0  # needed by scheduler
-    ema_fps = None
-    alpha = 0.15  # smoothing for FPS
+def run_processing_loop(args: argparse.Namespace, cap: cv2.VideoCapture, writer: cv2.VideoWriter, 
+                        components: Dict[str, object], total_frames: int, device: str) -> Stats:
+    """The main frame-by-frame processing loop."""
+    stats = Stats()
+    frame_idx = 0
+    keep_ids = set(int(x) for x in args.classes.split(",") if x.strip().isdigit()) if args.classes else None
+    
+    with tqdm(total=total_frames, unit="frame", dynamic_ncols=True, desc=f"Tracking [{device}]") as pbar:
+        while True:
+            f0 = perf_counter()
+            t = perf_counter()
+            ok, frame = cap.read()
+            stats.stage_timers["read"] += perf_counter() - t
+            if not ok: break
 
-    # Stage accumulators (seconds)
-    acc_read = acc_det = acc_emb = acc_track = acc_draw = acc_write = 0.0
-    acc_frame = 0.0
-    frame_times: list[float] = []  # per-frame total time (seconds) for p50/p95
+            t = perf_counter()
+            boxes, confs, clses = components["detector"].detect(frame, conf_thres=args.conf)
+            stats.stage_timers["detect"] += perf_counter() - t
+
+            if keep_ids and len(boxes) > 0:
+                mask = np.array([c in keep_ids for c in clses], dtype=bool)
+                boxes, confs, clses = boxes[mask], confs[mask], clses[mask]
+
+            embs, t_emb, refreshed_tids = components["scheduler"].run(
+                frame=frame, boxes=boxes, embedder=components["embedder"], tracker=components["tracker"],
+                frame_idx=frame_idx, budget_ms=args.embed_budget_ms
+            )
+            stats.stage_timers["embed"] += t_emb
+
+            t = perf_counter()
+            tracks = components["tracker"].update(boxes, embs, confs=confs, clses=clses)
+            stats.stage_timers["track"] += perf_counter() - t
+
+            t = perf_counter()
+            draw_tracks(frame, tracks, draw_lost=args.draw_lost, thickness=args.line_thickness,
+                        font_scale=args.font_scale, mark_tids=refreshed_tids)
+            stats.stage_timers["draw"] += perf_counter() - t
+
+            t = perf_counter()
+            writer.write(frame)
+            stats.stage_timers["write"] += perf_counter() - t
+
+            stats.frame_times.append(perf_counter() - f0)
+            frame_idx += 1
+            pbar.update(1)
+    
+    return stats
+
+def print_summary(args: argparse.Namespace, stats: Stats, meta: dict, wall_time: float, device: str, sched: EmbeddingScheduler):
+    """Prints the final performance and tracking summary."""
+    frames = len(stats.frame_times)
+    if frames == 0:
+        print("No frames were processed.")
+        return
+
+    total_time_s = sum(stats.frame_times)
+    mean_ms = 1000 * total_time_s / frames
+    eff_fps = frames / wall_time
+    p50, p95 = 1000 * np.percentile(np.array(stats.frame_times), [50, 95])
+
+    def pct(x): return 100 * x / total_time_s
+    def fmt_ms(s): return f"{1000 * s / frames:.1f} ms"
+    
+    print("\n" + "="*20 + " Tracking Summary " + "="*20)
+    print(f"  Video Source:   {args.source}  ->  {args.output}")
+    print(f"  Resolution:     {meta['width']}x{meta['height']} @ {meta['src_fps']:.2f} fps (output {meta['out_fps']:.2f} fps)")
+    print(f"  Device:         {device}")
+    print(f"  Frames:         {frames}  |  Wall Time: {wall_time:.2f}s  |  Effective FPS: {eff_fps:.1f}")
+    print(f"  Latency/frame:  mean {mean_ms:.1f} ms  |  p50 {p50:.1f} ms  |  p95 {p95:.1f} ms")
+    print("  Stage Breakdown (mean per frame | % of total):")
+    for name, seconds in stats.stage_timers.items():
+        print(f"    - {name:<7}: {fmt_ms(seconds):<10} | {pct(seconds):5.1f}%")
+    
+    print("-" * 58)
+    print(sched.summary(frames))
+    print("=" * 58)
+
+def main():
+    args = parse_args()
+    device = "cpu" if args.cpu else ("cuda" if torch.cuda.is_available() else "cpu")
     interrupted = False
 
     try:
-        while True:
-            f0 = perf_counter()
-
-            # --- READ ---
-            t = perf_counter()
-            ok, frame = cap.read()
-            t_read = perf_counter() - t
-            if not ok:
-                break
-
-            # --- DETECT ---
-            t = perf_counter()
-            boxes, confs, clses = detector.detect(frame, conf_thres=args.conf)
-            t_det = perf_counter() - t
-
-            # Optional class filtering
-            if keep_ids is not None and len(boxes) > 0:
-                m = np.array([c in keep_ids for c in clses], dtype=bool)
-                boxes, confs, clses = boxes[m], confs[m], clses[m]
-
-            # --- EMBED ---
-            embs, t_emb, refreshed_tids = sched.run(
-                frame=frame,
-                boxes=boxes,
-                embedder=embedder,
-                tracker=tracker,
-                frame_idx=frame_idx,
-                budget_ms=args.embed_budget_ms,
-            )
-
-            # --- TRACK ---
-            t = perf_counter()
-            tracks = tracker.update(boxes, embs, confs=confs, clses=clses)
-            t_track = perf_counter() - t
-
-            # --- DRAW ---
-            t = perf_counter()
-            draw_tracks(
-                frame, tracks,
-                draw_lost=args.draw_lost,
-                thickness=args.line_thickness,
-                font_scale=args.font_scale,
-                mark_tids=refreshed_tids   # label gets a "*" if an embed was computed this frame
-            )
-            t_draw = perf_counter() - t
-
-            # --- WRITE ---
-            t = perf_counter()
-            out.write(frame)
-            t_write = perf_counter() - t
-
-            # Totals / stats
-            f_dt = perf_counter() - f0
-            frames += 1
-            frame_idx += 1
-            frame_times.append(f_dt)
-            acc_read += t_read
-            acc_det += t_det
-            acc_emb += t_emb
-            acc_track += t_track
-            acc_draw += t_draw
-            acc_write += t_write
-            acc_frame += f_dt
-
-            # Live FPS (EMA) and stage timings in postfix
-            inst_fps = 1.0 / max(1e-6, f_dt)
-            ema_fps = inst_fps if ema_fps is None else (1 - alpha) * ema_fps + alpha * inst_fps
-            if frames % 5 == 0:
-                pbar.set_postfix({
-                    "fps": f"{ema_fps:.1f}",
-                    "det": _fmt_ms(t_det),
-                    "emb": _fmt_ms(t_emb),
-                    "trk": _fmt_ms(t_track),
-                    "draw": _fmt_ms(t_draw),
-                })
-
-            pbar.update(1)
+        cap, writer, meta = setup_video_io(args.source, args.output, args.fps)
+        components = initialize_components(args, device)
+        
+        t_start = perf_counter()
+        stats = run_processing_loop(args, cap, writer, components, meta["total_frames"], device)
+        wall_time = perf_counter() - t_start
 
     except KeyboardInterrupt:
-        interrupted = True  
-
-    # Cleanup
-    cap.release()
-    out.release()
-    pbar.close()
-
-    elapsed = perf_counter() - t_start
-    mean_ms = 1000.0 * acc_frame / max(1, frames)
-    eff_fps = frames / max(1e-9, elapsed)
-
-    def pct(x): return 100.0 * x / max(1e-9, acc_frame)
-
-    if frame_times:
-        arr = np.array(frame_times, dtype=np.float64) * 1000.0
-        p50 = float(np.percentile(arr, 50))
-        p95 = float(np.percentile(arr, 95))
-    else:
-        p50 = p95 = 0.0
-
+        interrupted = True
+        wall_time = perf_counter() - t_start
+    finally:
+        if 'cap' in locals(): cap.release()
+        if 'writer' in locals(): writer.release()
+        cv2.destroyAllWindows()
+    
     if interrupted:
         print("\n^C received — stopping gracefully. Partial output saved.")
 
-    print("\n=== Tracking summary ===")
-    print(f"Video:          {args.source}  →  {args.output}")
-    print(f"Resolution:     {W}x{H} @ {src_fps:.2f} fps (out {fps:.2f} fps)")
-    print(f"Device:         {device}")
-    print(f"Frames:         {frames}  |  Wall time: {elapsed:.2f}s  |  Effective FPS: {eff_fps:.1f}")
-    print(f"Latency/frame:  mean {mean_ms:.1f} ms  |  p50 {p50:.1f} ms  |  p95 {p95:.1f} ms")
-    print("Stage breakdown (mean per frame | share of total):")
-    print(f"  read : {_fmt_ms(acc_read / max(1, frames))}  | {pct(acc_read):5.1f}%")
-    print(f"  detect: {_fmt_ms(acc_det / max(1, frames))}  | {pct(acc_det):5.1f}%")
-    print(f"  embed : {_fmt_ms(acc_emb / max(1, frames))}  | {pct(acc_emb):5.1f}%")
-    print(f"  track : {_fmt_ms(acc_track / max(1, frames))} | {pct(acc_track):5.1f}%")
-    print(f"  draw  : {_fmt_ms(acc_draw / max(1, frames))}  | {pct(acc_draw):5.1f}%")
-    print(f"  write : {_fmt_ms(acc_write / max(1, frames))} | {pct(acc_write):5.1f}%")
-    other = max(0.0, acc_frame - (acc_read + acc_det + acc_emb + acc_track + acc_draw + acc_write))
-    print(f"  other : {_fmt_ms(other / max(1, frames))}  | {pct(other):5.1f}%")
-    print(f"Done. Wrote {args.output}. {'(interrupted)' if interrupted else ''} {elapsed:.1f}s total")
-    print(sched.summary(frames))
+    if 'stats' in locals():
+        print_summary(args, stats, meta, wall_time, device, components["scheduler"])
 
 if __name__ == "__main__":
     try:
         main()
     except GatedModelAccessError as e:
-        # Belt & suspenders: catch here too, print clean, no traceback
-        print(str(e))
+        print(str(e), file=sys.stderr)
         sys.exit(2)
-    except KeyboardInterrupt:
-        # Fallback, in case an early Ctrl-C happens before the main() loop installs its handler
-        print("\n^C received — exiting.")
-        sys.exit(130)
     except Exception as e:
-        # No ugly tracebacks unless explicitly requested
         if "--debug" in sys.argv or os.getenv("MOT_DEBUG") == "1":
             raise
-        print(f"Error: {e}")
+        print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
