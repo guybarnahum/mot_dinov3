@@ -52,7 +52,33 @@ cleanup_render() {
 }
 trap cleanup_render EXIT INT TERM
 
-# ---------------- Spinner run_and_log ----------------
+# ---------------- Error Filtering Function ---------------
+handle_error() {
+  local description="$1"
+  local log_file="$2"
+
+  # Check for specific, known errors and provide clean messages
+  if grep -q "Cannot access gated repo" "$log_file"; then
+    echo "🔑 Error: Hugging Face authentication failed."
+    echo "   This model is restricted and requires a token."
+    echo "   To fix, create a .env file with your token and re-run:"
+    echo "   echo \"HUGGINGFACE_HUB_TOKEN='hf_...'\" > .env"
+  
+  # Add more 'elif' checks here for other custom errors in the future
+  # elif grep -q "Some other specific error text" "$log_file"; then
+  #   echo "🔥 Custom message for another known error."
+
+  else
+    # Generic fallback for any unrecognized error
+    echo "An unexpected error occurred. Full log below:"
+    echo "--- ERROR LOG ---"
+    cat "$log_file"
+    echo "--- END OF LOG ---"
+  fi
+}
+
+# ---------------- Spinner run_and_log --------------------
+
 run_and_log() {
   local log_file; log_file=$(mktemp)
   local description="$1"; shift
@@ -97,9 +123,9 @@ run_and_log() {
     wait "$spinner_pid" &>/dev/null || true
     printf '\r\033[K%s' "${COLOR_RESET}"
     printf "❌ %s failed.\n" "$description"
-    echo "ERROR LOG :"
-    cat "$log_file"
-    echo "END OF ERROR LOG"
+
+    handle_error "$description" "$log_file"
+
     rm -f "$log_file"
     exit 1
   fi
@@ -153,8 +179,10 @@ if [[ "$uname_s" == "Linux" ]]; then
   if command -v nvidia-smi &>/dev/null && ! command -v nvcc &>/dev/null; then
     echo "NVIDIA GPU detected, but CUDA Toolkit not found."
     if ask_yes_no "Install CUDA Toolkit 12.4 now? [y/N]"; then
-      run_and_log "Download CUDA keyring" wget https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb
+    
+      run_and_log "Download CUDA keyring" wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
       run_and_log "Install CUDA keyring" sudo dpkg -i cuda-keyring_1.1-1_all.deb
+
       run_and_log "apt-get update (CUDA)" sudo apt-get update
       rm -f cuda-keyring_1.1-1_all.deb
       run_and_log "Install CUDA toolkit 12-4" sudo apt-get -y install cuda-toolkit-12-4
@@ -313,7 +341,20 @@ if [ -n "${HUGGINGFACE_HUB_TOKEN:-}" ]; then
   run_and_log "Hugging Face auth" huggingface-cli login --token "$HUGGINGFACE_HUB_TOKEN" --add-to-git-credential
 fi
 
+# ---------------- Step 7: Aliases ----------------
+alias venv='source .venv/bin/activate'
+
+if [ -f ~/.bashrc ]; then
+    echo "alias venv='source .venv/bin/activate'" >> ~/.bashrc
+    echo "✅ Alias 'venv' added to your Bash shell."
+fi
+
+if [ -f ~/.zshrc ]; then
+    echo "alias venv='source .venv/bin/activate'" >> ~/.zshrc
+    echo "✅ Alias 'venv' added to your Zsh shell."
+fi
+
 echo ""
 echo "✅ Setup complete (variant: ${VARIANT}${DINOV3_MODE:+, dinov3=${DINOV3_MODE}})."
-echo "Activate:   source ${VENV_DIR}/bin/activate"
+echo "Activate:   venv or source ${VENV_DIR}/bin/activate"
 echo "Run demo:   python cli.py --source data/input.mp4 --output outputs/tracked.mp4"
