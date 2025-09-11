@@ -2,7 +2,7 @@
 import os
 import argparse
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from time import perf_counter
 from typing import Dict, List, Tuple
 
