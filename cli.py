@@ -32,6 +32,7 @@ class SchedulerParams:
     overlap_thr: float
     iou_gate: float
     refresh_every: int
+    ema_alpha: float = 0.35
 
 @dataclass
 class TrackerParams:
