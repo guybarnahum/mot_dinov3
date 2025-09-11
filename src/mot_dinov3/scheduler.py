@@ -1,180 +1,150 @@
-# src/mot_dinov3/scheduler.py
+# src/mot_dinov3/scheduler.py (Refactored)
 from __future__ import annotations
+from collections import deque # REFACTOR: Use deque for an efficient queue
 from dataclasses import dataclass
 from time import perf_counter
 from typing import List, Optional, Tuple, Iterable, Set
 
+# Import shared helpers from the new utils module
+from . import utils
+
 import numpy as np
 import torch
 
-def _iou_xyxy(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    M, N = len(a), len(b)
-    if M == 0 or N == 0:
-        return np.zeros((M, N), dtype=np.float32)
-    a = a.astype(np.float32); b = b.astype(np.float32)
-    x11, y11, x12, y12 = a[:,0][:,None], a[:,1][:,None], a[:,2][:,None], a[:,3][:,None]
-    x21, y21, x22, y22 = b[:,0][None,:], b[:,1][None,:], b[:,2][None,:], b[:,3][None,:]
-    inter_w = np.maximum(0, np.minimum(x12, x22) - np.maximum(x11, x21))
-    inter_h = np.maximum(0, np.minimum(y12, y22) - np.maximum(y11, y21))
-    inter = inter_w * inter_h
-    area_a = (x12 - x11) * (y12 - y11)
-    area_b = (x22 - x21) * (y22 - y21)
-    union = area_a + area_b - inter + 1e-6
-    return (inter / union).astype(np.float32)
-
 @dataclass
 class SchedulerConfig:
-    overlap_thr: float = 0.2   # det-det IoU > thr => crowded
-    iou_gate: float = 0.6      # IoU with prior track ≥ gate => stable candidate
-    refresh_every: int = 5     # periodic refresh every N frames
-    ema_alpha: float = 0.35    # EMA for ms-per-crop
+    overlap_thr: float = 0.2
+    iou_gate: float = 0.6
+    refresh_every: int = 5
+    ema_alpha: float = 0.35
 
 class EmbeddingScheduler:
     """
-    Decides which detections need embeddings now and which can reuse,
-    and separates 'critical' (must compute) from 'refresh' (nice-to-have).
-    Also keeps a small backlog of refresh TIDs across frames.
+    Decides which detections need embeddings and which can reuse cached ones,
+    separating 'critical' from budget-limited 'refresh' computations.
     """
     def __init__(self, cfg: SchedulerConfig | None = None):
         self.cfg = cfg or SchedulerConfig()
-        self.last_embed_frame: dict[int, int] = {}  # tid -> frame_idx last *real* embed
-        self.pending_refresh: list[int] = []        # FIFO of tids to refresh when time allows
+        self.last_embed_frame: dict[int, int] = {}
+        # REFACTOR: Use deque for an O(1) FIFO queue
+        self.pending_refresh: deque[int] = deque()
         self.stat_real = 0
         self.stat_reuse = 0
-        self.ms_per_crop_ema: float = 5.0           # rough starting guess (GPU); updated per batch
+        self.ms_per_crop_ema: float = 5.0
 
     def reset_stats(self):
         self.stat_real = 0
         self.stat_reuse = 0
 
     def _push_pending(self, tids: Iterable[int]):
+        # REFACTOR: Use a set for faster `in` check
         seen = set(self.pending_refresh)
         for tid in tids:
-            if tid is None:
-                continue
-            if tid not in seen:
+            if tid is not None and tid not in seen:
                 self.pending_refresh.append(int(tid))
-                seen.add(int(tid))
 
     def _pop_pending(self, k: int) -> list[int]:
-        if k <= 0:
-            return []
-        k = min(k, len(self.pending_refresh))
-        out = self.pending_refresh[:k]
-        self.pending_refresh = self.pending_refresh[k:]
-        return out
+        if k <= 0: return []
+        popped = []
+        for _ in range(min(k, len(self.pending_refresh))):
+            popped.append(self.pending_refresh.popleft())
+        return popped
 
     def _remove_pending(self, tids: Iterable[int]):
-        if not tids:
-            return
+        if not tids: return
+        # REFACTOR: Rebuilding is efficient for deque when removing multiple items
         s = set(int(t) for t in tids)
-        self.pending_refresh = [t for t in self.pending_refresh if t not in s]
+        self.pending_refresh = deque(t for t in self.pending_refresh if t not in s)
 
     @staticmethod
     def _embedder_device_type(embedder) -> str:
-        """
-        Return 'cuda' or 'cpu' given either a DINOExtractor or a raw embedder.
-        Handles the adapter case where the real embedder is at ._e.
-        """
+        """Heuristically determines the device ('cuda' or 'cpu') of the embedder."""
         dev = getattr(embedder, "device", None)
-        if dev is None and hasattr(embedder, "_e"):  # DINOExtractor → DinoV3Embedder
+        # Handle cases where the actual model is wrapped
+        if dev is None and hasattr(embedder, "_e"):
             dev = getattr(embedder._e, "device", None)
         if isinstance(dev, torch.device):
             return dev.type
         return str(dev or "cpu")
         
-    def plan(self, tracker, boxes: np.ndarray, frame_idx: int) -> tuple[
-        np.ndarray,           # need_mask: (N,) True => compute embedding
-        list[Optional[int]],  # reuse_tid: per det, tid to reuse from (if reusing)
-        list,                 # active_snapshot: ACTIVE tracks list
-        np.ndarray,           # due_refresh_mask: (N,) True => this need is "refresh only"
-        list[Optional[int]],  # match_tid: per det, best-matching ACTIVE tid (if any)
-    ]:
+    def plan(self, tracker, boxes: np.ndarray, frame_idx: int):
         N = len(boxes)
-        need_mask = np.ones(N, dtype=bool)
-        reuse_tid: list[Optional[int]] = [None] * N
-        due_refresh = np.zeros(N, dtype=bool)
-        match_tid: list[Optional[int]] = [None] * N
-
         active = [t for t in getattr(tracker, "tracks", []) if getattr(t, "state", "active") == "active"]
-        if N == 0:
-            return need_mask, reuse_tid, active, due_refresh, match_tid
-        if len(active) == 0:
-            # first frames: everything is critical (no reuse, no refresh)
-            return need_mask, reuse_tid, active, due_refresh, match_tid
 
-        # crowded detections
-        crowded = np.zeros(N, dtype=bool)
-        if N > 1:
-            I_det = _iou_xyxy(boxes, boxes)
-            np.fill_diagonal(I_det, 0.0)
-            crowded = (I_det > self.cfg.overlap_thr).any(axis=1)
+        if N == 0 or len(active) == 0:
+            # No tracks to reuse from or no detections to process
+            iou_active_det = np.zeros((len(active), N), dtype=np.float32)
+            return (
+                np.ones(N, dtype=bool), [None] * N, active, 
+                np.zeros(N, dtype=bool), [None] * N, iou_active_det
+            )
 
-        # continuity to ACTIVE tracks
-        A = np.stack([t.box for t in active], axis=0).astype(np.float32)
-        I = _iou_xyxy(A, boxes)          # (T,N)
-        best_idx = I.argmax(axis=0)      # index into active
-        best_iou = I.max(axis=0)
+        # REFACTOR: Vectorized planning logic
+        # 1. Identify crowded detections
+        iou_det_det = utils.iou_matrix(boxes, boxes)
+        np.fill_diagonal(iou_det_det, 0.0)
+        is_crowded = (iou_det_det > self.cfg.overlap_thr).any(axis=1)
 
-        for j in range(N):
-            # no good match → critical (e.g., new object)
-            if best_iou[j] < self.cfg.iou_gate:
-                continue
-            # crowded → critical (needs appearance now)
-            if crowded[j]:
-                continue
-            # at this point: stable candidate
-            tid = int(active[best_idx[j]].tid)
-            match_tid[j] = tid
-            last = self.last_embed_frame.get(tid, -10**9)
-            if (frame_idx - last) >= self.cfg.refresh_every:
-                # refresh-only need (optional; can be deferred under budget)
-                due_refresh[j] = True
-            else:
-                # safe to reuse
-                need_mask[j] = False
-                reuse_tid[j] = tid
+        # 2. Find best-matching active track for each detection
+        active_boxes = np.stack([t.box for t in active]).astype(np.float32)
+        iou_active_det = utils.iou_matrix(active_boxes, boxes) # (T, N)
+        
+        best_track_idx = iou_active_det.argmax(axis=0) # (N,)
+        best_iou = iou_active_det.max(axis=0)          # (N,)
+        
+        match_tid = [int(active[best_track_idx[j]].tid) for j in range(N)]
 
-        # stash refresh TIDs as backlog candidates (we may do only some this frame)
-        due_tids = [match_tid[j] for j in range(N) if due_refresh[j] and match_tid[j] is not None]
+        # 3. Determine who can reuse embeddings
+        can_reuse = (best_iou >= self.cfg.iou_gate) & ~is_crowded
+        
+        # 4. From reusable candidates, see who is due for a refresh
+        is_due_refresh = np.zeros(N, dtype=bool)
+        if np.any(can_reuse):
+            reusable_indices = np.where(can_reuse)[0]
+            for j in reusable_indices:
+                tid = match_tid[j]
+                last = self.last_embed_frame.get(tid, -1)
+                if (frame_idx - last) >= self.cfg.refresh_every:
+                    is_due_refresh[j] = True
+        
+        # 5. Finalize masks and lists
+        # Need embedding if it's not a safe reuse (i.e., critical or due for refresh)
+        need_mask = ~can_reuse | is_due_refresh
+        
+        # Can only reuse if it's a stable candidate NOT due for refresh
+        can_truly_reuse = can_reuse & ~is_due_refresh
+        reuse_tid = [match_tid[j] if can_truly_reuse[j] else None for j in range(N)]
+        
+        # TIDs due for refresh are candidates for the backlog
+        due_tids = [match_tid[j] for j in np.where(is_due_refresh)[0]]
         self._push_pending(due_tids)
-        return need_mask, reuse_tid, active, due_refresh, match_tid
 
-    def mark_refreshed(self, active_snapshot: list, boxes: np.ndarray, idx_need: np.ndarray, frame_idx: int) -> set[int]:
-        """
-        After computing real embeddings for detections idx_need (this frame),
-        assign those refreshes to the most plausible ACTIVE track by IoU.
-        Returns set of refreshed tids.
-        """
+        # Make match_tid None where IoU is too low
+        final_match_tid = [match_tid[j] if best_iou[j] >= self.cfg.iou_gate else None for j in range(N)]
+
+        return need_mask, reuse_tid, active, is_due_refresh, final_match_tid, iou_active_det
+
+    # REFACTOR: Pass IoU matrix to avoid re-computation
+    def mark_refreshed(self, active_snapshot: list, boxes: np.ndarray, idx_need: np.ndarray, frame_idx: int, iou_matrix_val: np.ndarray) -> set[int]:
         refreshed: set[int] = set()
         if len(idx_need) == 0 or len(active_snapshot) == 0:
             return refreshed
-        A = np.stack([t.box for t in active_snapshot], axis=0).astype(np.float32)
-        # IoU(A, boxes)
-        x11, y11, x12, y12 = A[:,0][:,None], A[:,1][:,None], A[:,2][:,None], A[:,3][:,None]
-        B = boxes.astype(np.float32)
-        x21, y21, x22, y22 = B[:,0][None,:], B[:,1][None,:], B[:,2][None,:], B[:,3][None,:]
-        inter_w = np.maximum(0, np.minimum(x12, x22) - np.maximum(x11, x21))
-        inter_h = np.maximum(0, np.minimum(y12, y22) - np.maximum(y11, y21))
-        inter = inter_w * inter_h
-        area_a = (x12 - x11) * (y12 - y11)
-        area_b = (x22 - x21) * (y22 - y21)
-        I = inter / (area_a + area_b - inter + 1e-6)  # (T,N)
-
-        best_idx = I.argmax(axis=0)
-        for j in idx_need:
-            tid = int(active_snapshot[best_idx[j]].tid)
+        
+        best_track_indices = iou_matrix_val[:, idx_need].argmax(axis=0)
+        
+        for i, det_idx in enumerate(idx_need):
+            track_idx = best_track_indices[i]
+            tid = int(active_snapshot[track_idx].tid)
             self.last_embed_frame[tid] = frame_idx
             refreshed.add(tid)
-        # remove these tids from backlog if present
+            
         self._remove_pending(refreshed)
         return refreshed
 
     def update_ema_ms_per_crop(self, batch_ms: float, count: int):
-        if count <= 0:
-            return
-        per = batch_ms / max(1, count)
-        a = float(self.cfg.ema_alpha)
+        if count <= 0: return
+        per = batch_ms / count
+        a = self.cfg.ema_alpha
         self.ms_per_crop_ema = (1 - a) * self.ms_per_crop_ema + a * per
 
     @torch.inference_mode()
@@ -185,136 +155,104 @@ class EmbeddingScheduler:
             tracker,
             frame_idx: int,
             budget_ms: float = 0.0) -> Tuple[np.ndarray, float, Set[int]]:
-        """
-        Orchestrate embeddings for this frame:
-        1) Reuse cached vectors where allowed (for stable tracks).
-        2) Compute 'critical' embeddings immediately (new/crowded/weak IoU).
-        3) Spend remaining per-frame budget on 'refresh' embeddings for stale tracks.
-
-        Returns:
-        embs           : (N,D) float32
-        t_emb_seconds  : wall time spent here
-        refreshed_tids : set of track IDs refreshed now (for UI '*')
-        """
-        on_cuda = (self._embedder_device_type(embedder) == "cuda")
-        if on_cuda:
-            torch.cuda.synchronize()
+        on_cuda = self._embedder_device_type(embedder) == "cuda"
+        if on_cuda: torch.cuda.synchronize()
         t0 = perf_counter()
 
-        N = int(len(boxes))
-        D = int(getattr(embedder, "dim", getattr(embedder, "emb_dim", 768)))
+        N = len(boxes)
+        D = int(getattr(embedder, "dim", 768))
         if N == 0:
             return np.zeros((0, D), dtype=np.float32), 0.0, set()
 
-        need_mask, reuse_tids, active_snapshot, due_mask, match_tid = self.plan(tracker, boxes, frame_idx)
+        # REFACTOR: plan now returns the IoU matrix to be reused
+        need_mask, reuse_tids, active, due_mask, match_tid, iou_active_det = self.plan(tracker, boxes, frame_idx)
 
         embs = np.zeros((N, D), dtype=np.float32)
         refreshed_tids: set[int] = set()
 
-        # ---- Reuse cached
-        if len(active_snapshot):
-            tid2emb = {int(t.tid): t.emb for t in active_snapshot}
+        # Handle reuse
+        if len(active) > 0:
+            tid2emb = {int(t.tid): t.emb for t in active}
             for j, tid in enumerate(reuse_tids):
                 if tid is not None and tid in tid2emb:
                     embs[j] = tid2emb[tid]
                     self.stat_reuse += 1
-
-        # ---- 1) Critical set (not budgeted)
-        idx_crit = np.nonzero(need_mask & ~due_mask)[0]
+        
+        # --- Compute Critical Embeddings (not budgeted) ---
+        idx_crit = np.where(need_mask & ~due_mask)[0]
         if len(idx_crit) > 0:
-            t1 = perf_counter()
-            embs_crit = embedder.embed_crops(frame, boxes[idx_crit])
-            if on_cuda:
-                torch.cuda.synchronize()
-            batch_ms = (perf_counter() - t1) * 1000.0
+            embs_crit, _ = self._compute_embeddings(frame, boxes, idx_crit, embedder, on_cuda)
             embs[idx_crit] = embs_crit
-            self.update_ema_ms_per_crop(batch_ms, len(idx_crit))
-            self.stat_real += len(idx_crit)
-            refreshed_tids |= self.mark_refreshed(active_snapshot, boxes, idx_crit, frame_idx)
+            refreshed_tids |= self.mark_refreshed(active, boxes, idx_crit, frame_idx, iou_active_det)
 
-        # Remaining budget (ms)
-        if budget_ms <= 0:
-            remaining_ms = float("inf")
-        else:
-            if on_cuda:
-                torch.cuda.synchronize()
-            used_ms = (perf_counter() - t0) * 1000.0
-            remaining_ms = max(0.0, budget_ms - used_ms)
+        # --- Compute Refresh Embeddings (budgeted) ---
+        if on_cuda: torch.cuda.synchronize()
+        used_ms = (perf_counter() - t0) * 1000.0
+        remaining_ms = max(0.0, budget_ms - used_ms) if budget_ms > 0 else float('inf')
 
-        # ---- 2) Refresh (strictly budgeted)
-        if remaining_ms > 0 and len(active_snapshot) > 0:
-            # rank stale first
-            def _stale(tid: int) -> int:
-                return frame_idx - int(self.last_embed_frame.get(int(tid), -10**9))
-
-            due_tids_this = [tid for j, tid in enumerate(match_tid) if due_mask[j] and tid is not None]
-            due_order = sorted(set(due_tids_this), key=_stale, reverse=True)
-            candidates = list(self.pending_refresh) + [t for t in due_order if t not in self.pending_refresh]
-
-            # map TID → best det index via IoU with ACTIVE snapshot
-            best_det_for_tid = self._map_best_det_for_tids(active_snapshot, boxes)
-
-            chosen_now: list[int] = []
-            for tid in candidates:
-                if budget_ms <= 0:  # unlimited
-                    chosen_now.append(int(tid)); continue
-                if on_cuda:
-                    torch.cuda.synchronize()
-                used_ms = (perf_counter() - t0) * 1000.0
-                remaining_ms = max(0.0, budget_ms - used_ms)
-                est = max(0.5, self.ms_per_crop_ema)
-                if remaining_ms < est:
-                    break
-                chosen_now.append(int(tid))
-
-            idx_refresh: list[int] = []
-            for tid in chosen_now:
-                j = best_det_for_tid.get(int(tid))
-                if j is None or j in idx_crit or j in idx_refresh:
-                    continue
-                idx_refresh.append(int(j))
-
+        if remaining_ms > 0 and len(active) > 0:
+            idx_refresh = self._get_budgeted_refresh_indices(
+                active, boxes, match_tid, due_mask, idx_crit, frame_idx,
+                iou_active_det, t0, budget_ms
+            )
             if len(idx_refresh) > 0:
-                t2 = perf_counter()
-                embs_ref = embedder.embed_crops(frame, boxes[np.array(idx_refresh, dtype=int)])
-                if on_cuda:
-                    torch.cuda.synchronize()
-                batch_ms = (perf_counter() - t2) * 1000.0
-                embs[np.array(idx_refresh, dtype=int)] = embs_ref
-                self.update_ema_ms_per_crop(batch_ms, len(idx_refresh))
-                self.stat_real += len(idx_refresh)
-                refreshed_tids |= self.mark_refreshed(active_snapshot, boxes, np.array(idx_refresh, dtype=int), frame_idx)
-                self._remove_pending(chosen_now)
+                embs_ref, _ = self._compute_embeddings(frame, boxes, idx_refresh, embedder, on_cuda)
+                embs[idx_refresh] = embs_ref
+                refreshed_this_batch = self.mark_refreshed(active, boxes, idx_refresh, frame_idx, iou_active_det)
+                refreshed_tids |= refreshed_this_batch
+        
+        if on_cuda: torch.cuda.synchronize()
+        return embs, perf_counter() - t0, refreshed_tids
 
-        if on_cuda:
-            torch.cuda.synchronize()
-        return embs, (perf_counter() - t0), refreshed_tids
+    def _compute_embeddings(self, frame, boxes, indices, embedder, on_cuda):
+        """Helper to run embedder and update EMA time."""
+        t1 = perf_counter()
+        embeddings = embedder.embed_crops(frame, boxes[indices])
+        if on_cuda: torch.cuda.synchronize()
+        batch_ms = (perf_counter() - t1) * 1000.0
+        
+        self.update_ema_ms_per_crop(batch_ms, len(indices))
+        self.stat_real += len(indices)
+        return embeddings, batch_ms
 
-    def _map_best_det_for_tids(self, active_snapshot, boxes: np.ndarray) -> dict[int, int]:
-        """For each ACTIVE tid, pick the detection index with max IoU this frame."""
-        if len(active_snapshot) == 0 or len(boxes) == 0:
+    def _get_budgeted_refresh_indices(self, active, boxes, match_tid, due_mask, idx_crit, frame_idx, iou_active_det, t0, budget_ms):
+        """Determines which tracks to refresh within the time budget."""
+        # Prioritize candidates from the backlog, then this frame's due items
+        due_tids_this = {match_tid[j] for j in np.where(due_mask)[0] if match_tid[j] is not None}
+        candidates = list(self.pending_refresh) + [t for t in sorted(due_tids_this, reverse=True) if t not in self.pending_refresh]
+        
+        # Map each track to its best-matching detection this frame
+        tid_to_det_map = self._map_tids_to_best_det(active, iou_active_det)
+
+        idx_refresh = []
+        processed_tids = set()
+
+        for tid in candidates:
+            if budget_ms > 0:
+                if (perf_counter() - t0) * 1000.0 + self.ms_per_crop_ema > budget_ms:
+                    break # Predicted to go over budget
+            
+            det_idx = tid_to_det_map.get(tid)
+            if det_idx is not None and det_idx not in idx_crit and det_idx not in idx_refresh:
+                idx_refresh.append(det_idx)
+                processed_tids.add(tid)
+
+        self._remove_pending(processed_tids)
+        return np.array(idx_refresh, dtype=int)
+
+    # REFACTOR: Simplified, vectorized, and uses pre-computed IoU
+    def _map_tids_to_best_det(self, active_snapshot, iou_active_det: np.ndarray) -> dict[int, int]:
+        """For each active track, find the detection index with the highest IoU."""
+        if not active_snapshot or iou_active_det.shape[1] == 0:
             return {}
-        A = np.stack([t.box for t in active_snapshot], axis=0).astype(np.float32)
-        B = boxes.astype(np.float32)
-        x11, y11, x12, y12 = A[:,0][:,None], A[:,1][:,None], A[:,2][:,None], A[:,3][:,None]
-        x21, y21, x22, y22 = B[:,0][None,:], B[:,1][None,:], B[:,2][None,:], B[:,3][None,:]
-        inter_w = np.maximum(0, np.minimum(x12, x22) - np.maximum(x11, x21))
-        inter_h = np.maximum(0, np.minimum(y12, y22) - np.maximum(y11, y21))
-        inter = inter_w * inter_h
-        area_a = (x12 - x11) * (y12 - y11)
-        area_b = (x22 - x21) * (y22 - y21)
-        I = inter / (area_a + area_b - inter + 1e-6)  # (T,N)
-
-        best: dict[int, int] = {}
-        for det_j in range(len(B)):
-            trk_i = int(I[:, det_j].argmax())
-            tid = int(active_snapshot[trk_i].tid)
-            if (tid not in best) or (I[trk_i, det_j] > I[trk_i, best[tid]]):
-                best[tid] = det_j
-        return best
+        
+        best_det_indices = iou_active_det.argmax(axis=1) # (T,)
+        return {
+            int(track.tid): best_det_indices[i]
+            for i, track in enumerate(active_snapshot)
+        }
 
     def summary(self, frames: int) -> str:
-        if frames <= 0:
-            return "Embeddings computed: 0 total (0.00/frame), reused: 0"
+        if frames <= 0: return "Embeddings: 0 computed, 0 reused"
         per_frame = self.stat_real / frames
         return f"Embeddings computed: {self.stat_real} total ({per_frame:.2f}/frame), reused: {self.stat_reuse}"

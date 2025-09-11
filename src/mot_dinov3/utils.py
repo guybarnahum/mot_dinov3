@@ -1,28 +1,55 @@
+# src/mot_dinov3/utils.py
 import numpy as np
 
-def iou_matrix(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    if len(a) == 0 or len(b) == 0:
-        return np.zeros((len(a), len(b)), dtype=np.float32)
-    M, N = len(a), len(b)
-    ious = np.zeros((M, N), dtype=np.float32)
-    for i in range(M):
-        ax1, ay1, ax2, ay2 = a[i]
-        a_area = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
-        for j in range(N):
-            bx1, by1, bx2, by2 = b[j]
-            b_area = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
-            ix1, iy1 = max(ax1, bx1), max(ay1, by1)
-            ix2, iy2 = min(ax2, bx2), min(ay2, by2)
-            iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
-            inter = iw * ih
-            union = a_area + b_area - inter + 1e-6
-            ious[i, j] = inter / union
-    return ious
+def iou_matrix(boxes1: np.ndarray, boxes2: np.ndarray) -> np.ndarray:
+    """
+    Calculates a vectorized IoU matrix between two sets of boxes.
+    - boxes1: (M, 4) array of XYXY boxes
+    - boxes2: (N, 4) array of XYXY boxes
+    - Returns: (M, N) matrix of IoU scores
+    """
+    if boxes1.shape[0] == 0 or boxes2.shape[0] == 0:
+        return np.zeros((boxes1.shape[0], boxes2.shape[0]), dtype=np.float32)
 
-def cosine_sim_matrix(A: np.ndarray, B: np.ndarray) -> np.ndarray:
-    if len(A) == 0 or len(B) == 0:
-        return np.zeros((len(A), len(B)), dtype=np.float32)
-    A = A / (np.linalg.norm(A, axis=1, keepdims=True) + 1e-8)
-    B = B / (np.linalg.norm(B, axis=1, keepdims=True) + 1e-8)
-    return A @ B.T
+    # Vectorized intersection calculation
+    x11, y11, x12, y12 = np.split(boxes1, 4, axis=1)
+    x21, y21, x22, y22 = np.split(boxes2, 4, axis=1)
 
+    xA = np.maximum(x11, x21.T)
+    yA = np.maximum(y11, y21.T)
+    xB = np.minimum(x12, x22.T)
+    yB = np.minimum(y12, y22.T)
+
+    inter_area = np.maximum(0, xB - xA) * np.maximum(0, yB - yA)
+
+    # Vectorized area and union calculation
+    area1 = (x12 - x11) * (y12 - y11)
+    area2 = (x22 - x21) * (y22 - y21)
+    union_area = area1 + area2.T - inter_area
+
+    return (inter_area / (union_area + 1e-6)).astype(np.float32)
+
+def cosine_cost_matrix(A: np.ndarray, B: np.ndarray) -> np.ndarray:
+    """
+    Calculates the cosine distance (1 - similarity) between two sets of
+    L2-normalized embeddings. Lower values mean more similar.
+    - A: (M, D) array of embeddings
+    - B: (N, D) array of embeddings
+    - Returns: (M, N) matrix of cosine distances
+    """
+    if A.shape[0] == 0 or B.shape[0] == 0:
+        return np.zeros((A.shape[0], B.shape[0]), dtype=np.float32)
+    
+    # Assumes A and B are already L2-normalized, so similarity is a simple dot product
+    similarity = A @ B.T
+    
+    # Cost is 1 - similarity
+    return (1.0 - similarity).astype(np.float32)
+
+def centers_xyxy(b: np.ndarray) -> np.ndarray:
+    """Calculates the centers of boxes in XYXY format."""
+    if len(b) == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    cx = (b[:, 0] + b[:, 2]) * 0.5
+    cy = (b[:, 1] + b[:, 2]) * 0.5
+    return np.stack([cx, cy], axis=1).astype(np.float32)

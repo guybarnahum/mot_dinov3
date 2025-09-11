@@ -1,4 +1,4 @@
-# src/mot_dinov3/embedder.py
+# src/mot_dinov3/embedder.py (Full Replacement)
 from __future__ import annotations
 import os, math
 import numpy as np
@@ -125,12 +125,10 @@ class DinoV3Embedder:
             self._amp_dtype = torch.float32
 
         if (self.processor is None) and self.verbose:
-            print("[embedder] Manual preprocess: size=%, mean=%, std=%"
-                  .replace("%", "{}").format(
-                      getattr(self, "image_size", 224),
-                      [float(x) for x in self.mean.reshape(-1)[:3]],
-                      [float(x) for x in self.std.reshape(-1)[:3]]
-                  ))
+            # REFACTOR: Use a more readable f-string for output
+            mean_str = [f"{x:.3f}" for x in self.mean.flatten()]
+            std_str = [f"{x:.3f}" for x in self.std.flatten()]
+            print(f"[embedder] Manual preprocess: size={self.image_size}, mean={mean_str}, std={std_str}")
 
     # ---------- Preprocessing paths ----------
 
@@ -199,11 +197,13 @@ class DinoV3Embedder:
     @torch.inference_mode()
     def embed_crops(self, frame_bgr: np.ndarray, boxes_xyxy: np.ndarray,
                     pad_ratio: float = 0.12, square: bool = True) -> np.ndarray:
+        emb_dim = getattr(self, "emb_dim", 768)
         if boxes_xyxy is None or len(boxes_xyxy) == 0:
-            return np.zeros((0, getattr(self, "emb_dim", 768)), dtype=np.float32)
+            return np.zeros((0, emb_dim), dtype=np.float32)
 
         h, w = frame_bgr.shape[:2]
-        pil_batch: List[Image.Image] = []
+        pil_batch: List[Optional[Image.Image]] = []
+
         for (x1, y1, x2, y2) in boxes_xyxy.astype(int):
             # expand box
             bw, bh = x2 - x1, y2 - y1
@@ -217,27 +217,38 @@ class DinoV3Embedder:
                 px, py = int(round(bw * pad_ratio)), int(round(bh * pad_ratio))
                 x1, y1, x2, y2 = x1 - px, y1 - py, x2 + px, y2 + py
 
-            # clamp & minimum size
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(w - 1, x2), min(h - 1, y2)
-            if x2 <= x1 or y2 <= y1:
-                x2, y2 = min(w - 1, x1 + 2), min(h - 1, y1 + 2)
+            # REFACTOR: Robustly handle invalid/empty boxes after clamping
+            x1_c, y1_c = max(0, x1), max(0, y1)
+            x2_c, y2_c = min(w - 1, x2), min(h - 1, y2)
 
-            crop = cv2.cvtColor(frame_bgr[y1:y2, x1:x2], cv2.COLOR_BGR2RGB)
+            if x2_c <= x1_c or y2_c <= y1_c:
+                pil_batch.append(None)  # Add a placeholder for the invalid crop
+                continue
+
+            crop = cv2.cvtColor(frame_bgr[y1_c:y2_c, x1_c:x2_c], cv2.COLOR_BGR2RGB)
             pil_batch.append(Image.fromarray(crop))
+        
+        # Filter out None placeholders for model processing
+        valid_pil_images = [img for img in pil_batch if img is not None]
+        if not valid_pil_images:
+            return np.zeros((len(boxes_xyxy), emb_dim), dtype=np.float32)
 
-        inputs = self._prep_inputs(pil_batch)
+        inputs = self._prep_inputs(valid_pil_images)
 
-        # Proper autocast usage (context manager) — no manual __enter__/__exit__
         with self._maybe_autocast():
             out = self.model(**inputs)
 
-        # pool -> embedding
         if getattr(out, "pooler_output", None) is not None:
             emb = out.pooler_output
         else:
             toks = out.last_hidden_state
             emb = toks[:, 1:, :].mean(dim=1) if toks.shape[1] > 1 else toks[:, 0, :]
 
-        emb = torch.nn.functional.normalize(emb, dim=1)
-        return emb.detach().cpu().float().numpy()
+        valid_embs = torch.nn.functional.normalize(emb, dim=1).detach().cpu().float().numpy()
+
+        # Reconstruct the full embedding array, inserting zero vectors for invalid crops
+        final_embs = np.zeros((len(boxes_xyxy), emb_dim), dtype=np.float32)
+        valid_indices = [i for i, img in enumerate(pil_batch) if img is not None]
+        final_embs[valid_indices] = valid_embs
+        
+        return final_embs
