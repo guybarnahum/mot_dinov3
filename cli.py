@@ -141,6 +141,10 @@ def _create_arg_parser() -> argparse.ArgumentParser:
     # Special argument for config file
     ap.add_argument("-c", "--config", type=str, help="Path to a TOML configuration file")
 
+    # Arguments to exclude from automatic generation to avoid conflicts.
+    # These can still be set in the config.toml file under their respective sections.
+    EXCLUDE_ARGS = {'ema_alpha'}
+
     # Define groups for organized --help output
     groups = {
         'io': ap.add_argument_group("I/O"),
@@ -159,7 +163,9 @@ def _create_arg_parser() -> argparse.ArgumentParser:
         section_dc = config_field.type
         group = groups.get(section_name, ap)
         for field_info in fields(section_dc):
-            if field_info.name == 'config': continue # Skip adding --config twice
+            # FIX: Skip excluded args to prevent conflicts
+            if field_info.name == 'config' or field_info.name in EXCLUDE_ARGS:
+                continue
             
             cli_name = f"--{field_info.name.replace('_', '-')}"
             
@@ -388,5 +394,6 @@ if __name__ == "__main__":
             raise
         print(f"An unexpected error occurred: {e}", file=sys.stderr)
         sys.exit(1)
+
 
 
