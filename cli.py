@@ -9,7 +9,7 @@ video segments defined by start and end frames.
 import os
 import argparse
 import sys
-from dataclasses import dataclass, field, asdict, fields
+from dataclasses import dataclass, field, asdict, fields, MISSING
 from time import perf_counter
 from typing import Dict, List, Tuple, Optional, Any
 
@@ -169,7 +169,8 @@ def _create_arg_parser() -> argparse.ArgumentParser:
                 del arg_kwargs['type']
             # Help text generation
             help_text = ""
-            if field_info.default is not None and not isinstance(field_info.default, type(dataclasses.MISSING)):
+            # FIX: Check against the imported MISSING constant directly
+            if field_info.default is not MISSING:
                  help_text = f"(Default: {field_info.default})"
            
             group.add_argument(cli_name, help=help_text, **arg_kwargs)
@@ -387,4 +388,5 @@ if __name__ == "__main__":
             raise
         print(f"An unexpected error occurred: {e}", file=sys.stderr)
         sys.exit(1)
+
 
