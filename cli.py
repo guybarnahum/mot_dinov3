@@ -11,7 +11,7 @@ import argparse
 import sys
 from dataclasses import dataclass, field, asdict, fields, MISSING
 from time import perf_counter
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Tuple, Optional, Any, get_origin, get_args
 
 import cv2
 import numpy as np
@@ -157,25 +157,31 @@ def _create_arg_parser() -> argparse.ArgumentParser:
     }
     
     # Add arguments from dataclasses to the parser
-    # FIX: Correctly iterate over Field objects
     for config_field in fields(Config()):
         section_name = config_field.name
         section_dc = config_field.type
         group = groups.get(section_name, ap)
         for field_info in fields(section_dc):
-            # FIX: Skip excluded args to prevent conflicts
+            # Skip excluded args to prevent conflicts
             if field_info.name == 'config' or field_info.name in EXCLUDE_ARGS:
                 continue
             
             cli_name = f"--{field_info.name.replace('_', '-')}"
             
-            arg_kwargs = {'type': field_info.type, 'default': argparse.SUPPRESS}
-            if field_info.type == bool:
+            # FIX: Properly handle Optional[T] types for argparse
+            actual_type = field_info.type
+            origin = get_origin(actual_type)
+            if origin is not None:  # Handles Optional[T], Union[T, None], etc.
+                type_args = [arg for arg in get_args(actual_type) if arg is not type(None)]
+                if type_args:
+                    actual_type = type_args[0]
+
+            arg_kwargs = {'type': actual_type, 'default': argparse.SUPPRESS}
+            if actual_type == bool:
                 arg_kwargs['action'] = 'store_true'
                 del arg_kwargs['type']
-            # Help text generation
+            
             help_text = ""
-            # FIX: Check against the imported MISSING constant directly
             if field_info.default is not MISSING:
                  help_text = f"(Default: {field_info.default})"
            
@@ -200,7 +206,6 @@ def parse_and_merge_config() -> Config:
     final_config = Config()
     cli_args_dict = vars(args)
 
-    # FIX: Correctly iterate over Field objects
     for config_field in fields(final_config):
         section_name = config_field.name
         section_dc = config_field.type
@@ -394,6 +399,4 @@ if __name__ == "__main__":
             raise
         print(f"An unexpected error occurred: {e}", file=sys.stderr)
         sys.exit(1)
-
-
 
