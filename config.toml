@@ -19,7 +19,7 @@ imgsz = 640
 # classes = "0,2" # Example: track only persons (0) and cars (2)
 
 [embedder]
-embed_model = "facebook/dinov3-vits14" # Use a smaller DINOv3 model
+embed_model = "facebook/dinov3_vits14" # Use a smaller DINOv3 model
 embed_amp = "fp16"
 crop_pad = 0.1
 
