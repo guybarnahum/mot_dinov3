@@ -33,6 +33,9 @@ except ImportError:
         print("Please run: pip install tomli", file=sys.stderr)
         sys.exit(1)
 
+# FIX: Add programmatic Hugging Face login
+from huggingface_hub import login
+
 from mot_dinov3 import compat
 compat.apply(strict_numpy=False, quiet=True)
 
@@ -251,7 +254,7 @@ def setup_video_io(cfg: IOParams, meta: Dict[str, Any]) -> Tuple[cv2.VideoCaptur
         
     return cap, writer
 
-def initialize_components(cfg: Config, device: str, hf_token: Optional[str] = None) -> Dict[str, object]:
+def initialize_components(cfg: Config, device: str) -> Dict[str, object]:
     """Initializes all the main processing modules."""
     detector = Detector(cfg.detector.det, imgsz=cfg.detector.imgsz)
 
@@ -260,12 +263,10 @@ def initialize_components(cfg: Config, device: str, hf_token: Optional[str] = No
     else:
         amp_dtype = cfg.embedder.embed_amp if cfg.embedder.embed_amp != "off" else None
 
-    # FIX: Explicitly pass the Hugging Face token to the embedder factory
     embedder = create_extractor(
         cfg.embedder.embedder, cfg.embedder.embed_model, device,
         autocast=(device == "cuda"), amp_dtype=amp_dtype,
-        pad=cfg.embedder.crop_pad, square=cfg.embedder.crop_square,
-        token=hf_token
+        pad=cfg.embedder.crop_pad, square=cfg.embedder.crop_square
     )
     
     tracker = SimpleTracker(**asdict(cfg.tracker))
@@ -358,12 +359,15 @@ def main():
     device = "cpu" if cfg.system.cpu else ("cuda" if torch.cuda.is_available() else "cpu")
     interrupted = False
     
-    # FIX: Add validation check for source after all configs are merged
+    # Add validation check for source after all configs are merged
     if cfg.io.source is None:
         raise ValueError("Input video --source is required. Please provide it via the command line or in the config file.")
 
-    # FIX: Read token from environment to be passed explicitly
+    # Read token from environment and attempt programmatic login
     hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
+    if hf_token:
+        login(token=hf_token, add_to_git_credential=False)
+        print("Hugging Face token found and used for login.")
     
     video_meta = {}
     
@@ -375,8 +379,7 @@ def main():
         if frames_to_process <= 0:
             raise ValueError("End frame must be greater than start frame.")
         
-        # FIX: Pass the token to the component initializer
-        components = initialize_components(cfg, device, hf_token=hf_token)
+        components = initialize_components(cfg, device)
         
         t_start = perf_counter()
         stats = run_processing_loop(cfg, cap, writer, components, frames_to_process, device)
