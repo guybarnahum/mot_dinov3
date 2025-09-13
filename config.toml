@@ -1,0 +1,42 @@
+# config.toml
+# Example configuration file for cli.py.
+# Command-line arguments will override any settings defined here.
+
+[io]
+# source is required either here or on the command line.
+# source = "path/to/your/video.mp4" 
+# output = "outputs/processed_from_config.mp4"
+fps = 30.0 # Force output FPS to 30
+
+# NEW: Process only frames 300 to 900
+start_frame = 300
+end_frame = 900
+
+[detector]
+det = "yolov8s.pt" # Use a smaller, faster detector
+conf = 0.4
+imgsz = 640
+# classes = "0,2" # Example: track only persons (0) and cars (2)
+
+[embedder]
+embed_model = "facebook/dinov3-vits14" # Use a smaller DINOv3 model
+embed_amp = "fp16"
+crop_pad = 0.1
+
+[scheduler]
+refresh_every = 10 # Refresh embeddings less frequently
+iou_gate = 0.7
+
+[tracker]
+max_age = 45
+reid_sim_thresh = 0.65
+conf_high = 0.6
+conf_low = 0.2
+
+[viz]
+draw_lost = true
+line_thickness = 1
+font_scale = 0.4
+
+[system]
+# cpu = true # Uncomment to force CPU processing
