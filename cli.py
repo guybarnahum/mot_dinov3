@@ -153,7 +153,10 @@ def _create_arg_parser() -> argparse.ArgumentParser:
     }
     
     # Add arguments from dataclasses to the parser
-    for section_name, section_dc in fields(Config()):
+    # FIX: Correctly iterate over Field objects
+    for config_field in fields(Config()):
+        section_name = config_field.name
+        section_dc = config_field.type
         group = groups.get(section_name, ap)
         for field_info in fields(section_dc):
             if field_info.name == 'config': continue # Skip adding --config twice
@@ -190,7 +193,10 @@ def parse_and_merge_config() -> Config:
     final_config = Config()
     cli_args_dict = vars(args)
 
-    for section_name, section_dc in fields(final_config):
+    # FIX: Correctly iterate over Field objects
+    for config_field in fields(final_config):
+        section_name = config_field.name
+        section_dc = config_field.type
         section_config = config_data.get(section_name, {})
         for field_info in fields(section_dc):
             value = cli_args_dict.get(field_info.name)
