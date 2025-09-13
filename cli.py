@@ -9,7 +9,17 @@ video segments defined by start and end frames.
 import os
 import argparse
 import sys
-import tomli  # Use 'tomli' for Python < 3.11, or 'toml' for 3.11+
+
+try:
+    import tomllib  # Standard library in Python 3.11+
+except ImportError:
+    try:
+        import tomli as tomllib  # Fallback for Python < 3.11
+    except ImportError:
+        print("Error: 'tomli' is required for this script on Python < 3.11.", file=sys.stderr)
+        print("Please run: pip install tomli", file=sys.stderr)
+        sys.exit(1)
+
 from dataclasses import dataclass, field, asdict, fields
 from time import perf_counter
 from typing import Dict, List, Tuple, Optional, Any
@@ -174,8 +184,8 @@ def parse_and_merge_config() -> Config:
     if config_path:
         if not os.path.exists(config_path):
             raise FileNotFoundError(f"Config file not found: {config_path}")
-        with open(config_path, "rb") as f:
-            config_data = tomli.load(f)
+        with open(config_path, "rb") as f:            
+            config_data = tomllib.load(f)
 
     # Merge logic: CLI > TOML > Dataclass Defaults
     final_config = Config()
