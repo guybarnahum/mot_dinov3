@@ -12,7 +12,7 @@ The core innovation is a **smart, budget-aware scheduler** that dramatically red
 
 ## ✨ Features
 
-  - **Detector**: Ultralytics YOLO (configurable, e.g., YOLOv8, YOLOv9).
+  - **Detector**: Ultralytics YOLO (configurable, e.g., YOLOv8, YOLO11).
   - **Embedder**: DINOv3 (gated) or DINOv2 (open) via 🤗 Transformers. Easily extendable to other models (CLIP, ResNet, etc.).
   - **Tracker**: A robust tracker using IoU and cosine similarity, with Hungarian or greedy assignment. It handles track lifecycle (Active, Lost) and uses a confidence-weighted EMA to maintain stable embeddings.
   - **Smart Scheduler**: The key to performance. It minimizes expensive embedding computations by reusing features for stable tracks and only running the embedder when necessary, all while honoring a per-frame time budget.
