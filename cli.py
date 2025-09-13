@@ -19,6 +19,9 @@ import torch
 from dotenv import load_dotenv
 from tqdm.auto import tqdm
 
+# Load .env file for HF_TOKEN
+load_dotenv()
+
 # FIX: Import tomllib for Python 3.11+ and fall back to tomli
 try:
     import tomllib  # Standard library in Python 3.11+
@@ -248,7 +251,7 @@ def setup_video_io(cfg: IOParams, meta: Dict[str, Any]) -> Tuple[cv2.VideoCaptur
         
     return cap, writer
 
-def initialize_components(cfg: Config, device: str) -> Dict[str, object]:
+def initialize_components(cfg: Config, device: str, hf_token: Optional[str] = None) -> Dict[str, object]:
     """Initializes all the main processing modules."""
     detector = Detector(cfg.detector.det, imgsz=cfg.detector.imgsz)
 
@@ -257,10 +260,12 @@ def initialize_components(cfg: Config, device: str) -> Dict[str, object]:
     else:
         amp_dtype = cfg.embedder.embed_amp if cfg.embedder.embed_amp != "off" else None
 
+    # FIX: Explicitly pass the Hugging Face token to the embedder factory
     embedder = create_extractor(
         cfg.embedder.embedder, cfg.embedder.embed_model, device,
         autocast=(device == "cuda"), amp_dtype=amp_dtype,
-        pad=cfg.embedder.crop_pad, square=cfg.embedder.crop_square
+        pad=cfg.embedder.crop_pad, square=cfg.embedder.crop_square,
+        token=hf_token
     )
     
     tracker = SimpleTracker(**asdict(cfg.tracker))
@@ -357,6 +362,9 @@ def main():
     if cfg.io.source is None:
         raise ValueError("Input video --source is required. Please provide it via the command line or in the config file.")
 
+    # FIX: Read token from environment to be passed explicitly
+    hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
+    
     video_meta = {}
     
     try:
@@ -366,8 +374,9 @@ def main():
         frames_to_process = end_frame - cfg.io.start_frame
         if frames_to_process <= 0:
             raise ValueError("End frame must be greater than start frame.")
-
-        components = initialize_components(cfg, device)
+        
+        # FIX: Pass the token to the component initializer
+        components = initialize_components(cfg, device, hf_token=hf_token)
         
         t_start = perf_counter()
         stats = run_processing_loop(cfg, cap, writer, components, frames_to_process, device)
