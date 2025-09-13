@@ -10,6 +10,7 @@
 #     [t4_gpu] -> torch==2.4.2 (CUDA wheels from ${TORCH_CHANNEL}, default cu124)
 # - Optional Hugging Face auth if HUGGINGFACE_HUB_TOKEN is set
 # - Optional: Enable **DINOv3** support by upgrading Transformers (stable/edge)
+# - Install alias 'venv' -> source .venv/bin/activate
 #
 set -e
 
