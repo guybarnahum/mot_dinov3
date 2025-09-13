@@ -9,17 +9,6 @@ video segments defined by start and end frames.
 import os
 import argparse
 import sys
-
-try:
-    import tomllib  # Standard library in Python 3.11+
-except ImportError:
-    try:
-        import tomli as tomllib  # Fallback for Python < 3.11
-    except ImportError:
-        print("Error: 'tomli' is required for this script on Python < 3.11.", file=sys.stderr)
-        print("Please run: pip install tomli", file=sys.stderr)
-        sys.exit(1)
-
 from dataclasses import dataclass, field, asdict, fields
 from time import perf_counter
 from typing import Dict, List, Tuple, Optional, Any
@@ -30,8 +19,16 @@ import torch
 from dotenv import load_dotenv
 from tqdm.auto import tqdm
 
-# Load .env file for HF_TOKEN
-load_dotenv()
+# FIX: Import tomllib for Python 3.11+ and fall back to tomli
+try:
+    import tomllib  # Standard library in Python 3.11+
+except ImportError:
+    try:
+        import tomli as tomllib  # Fallback for Python < 3.11
+    except ImportError:
+        print("Error: 'tomli' is required for this script on Python < 3.11.", file=sys.stderr)
+        print("Please run: pip install tomli", file=sys.stderr)
+        sys.exit(1)
 
 from mot_dinov3 import compat
 compat.apply(strict_numpy=False, quiet=True)
@@ -49,7 +46,8 @@ from mot_dinov3.viz import draw_tracks
 
 @dataclass
 class IOParams:
-    source: str
+    # FIX: Make source optional with a default of None to allow delayed initialization
+    source: Optional[str] = None
     output: str = "outputs/tracked.mp4"
     fps: float = 0.0
     start_frame: int = 0
@@ -160,16 +158,18 @@ def _create_arg_parser() -> argparse.ArgumentParser:
         for field_info in fields(section_dc):
             if field_info.name == 'config': continue # Skip adding --config twice
             
-            # Create CLI argument name (e.g., 'start_frame' -> '--start-frame')
             cli_name = f"--{field_info.name.replace('_', '-')}"
             
-            # Determine argument type and action for booleans
             arg_kwargs = {'type': field_info.type, 'default': argparse.SUPPRESS}
             if field_info.type == bool:
                 arg_kwargs['action'] = 'store_true'
                 del arg_kwargs['type']
-            
-            group.add_argument(cli_name, help=f"(Default: {field_info.default})", **arg_kwargs)
+            # Help text generation
+            help_text = ""
+            if field_info.default is not None and not isinstance(field_info.default, type(dataclasses.MISSING)):
+                 help_text = f"(Default: {field_info.default})"
+           
+            group.add_argument(cli_name, help=help_text, **arg_kwargs)
 
     return ap
 
@@ -184,24 +184,18 @@ def parse_and_merge_config() -> Config:
     if config_path:
         if not os.path.exists(config_path):
             raise FileNotFoundError(f"Config file not found: {config_path}")
-        with open(config_path, "rb") as f:            
+        with open(config_path, "rb") as f:
             config_data = tomllib.load(f)
 
-    # Merge logic: CLI > TOML > Dataclass Defaults
     final_config = Config()
     cli_args_dict = vars(args)
 
     for section_name, section_dc in fields(final_config):
         section_config = config_data.get(section_name, {})
         for field_info in fields(section_dc):
-            # 1. Get value from CLI if provided
             value = cli_args_dict.get(field_info.name)
-            
-            # 2. If not in CLI, get value from TOML
             if value is None:
                 value = section_config.get(field_info.name)
-            
-            # 3. If still not found, it will keep the dataclass default
             if value is not None:
                 setattr(getattr(final_config, section_name), field_info.name, value)
 
@@ -221,7 +215,6 @@ def setup_video_io(cfg: IOParams, meta: Dict[str, Any]) -> Tuple[cv2.VideoCaptur
     meta["total_frames"] = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     meta["out_fps"] = cfg.fps if cfg.fps > 0 else meta["src_fps"]
 
-    # Seek to start frame if specified
     if cfg.start_frame > 0:
         if cfg.start_frame >= meta["total_frames"]:
             raise ValueError(f"Start frame ({cfg.start_frame}) is after the end of the video ({meta['total_frames']})")
@@ -342,12 +335,15 @@ def main():
     device = "cpu" if cfg.system.cpu else ("cuda" if torch.cuda.is_available() else "cpu")
     interrupted = False
     
+    # FIX: Add validation check for source after all configs are merged
+    if cfg.io.source is None:
+        raise ValueError("Input video --source is required. Please provide it via the command line or in the config file.")
+
     video_meta = {}
     
     try:
         cap, writer = setup_video_io(cfg.io, video_meta)
 
-        # Determine number of frames to process
         end_frame = cfg.io.end_frame if cfg.io.end_frame is not None else video_meta["total_frames"]
         frames_to_process = end_frame - cfg.io.start_frame
         if frames_to_process <= 0:
@@ -385,3 +381,4 @@ if __name__ == "__main__":
             raise
         print(f"An unexpected error occurred: {e}", file=sys.stderr)
         sys.exit(1)
+
