@@ -180,15 +180,23 @@ def _create_arg_parser() -> argparse.ArgumentParser:
     return ap
 
 def parse_and_merge_config() -> Config:
-    """Parses CLI args, loads TOML config, and merges them."""
-    # --- THIS IS THE FIX ---
-    # The parser must be created and assigned before it can be used.
+    """
+    Parses CLI args, loads TOML config, and merges them.
+    NEW: Automatically loads 'config.toml' if it exists and --config is not specified.
+    """
     parser = _create_arg_parser()
     args = parser.parse_args()
-    # -----------------------
     
     config_data = {}
     config_path = getattr(args, 'config', None)
+    
+    # --- THIS BLOCK IS THE IMPROVEMENT ---
+    # If no config path is given via CLI, check for a default 'config.toml'
+    if config_path is None and os.path.exists("config.toml"):
+        print("Found 'config.toml' in the current directory, loading it by default.")
+        config_path = "config.toml"
+    # ------------------------------------
+
     if config_path:
         if not os.path.exists(config_path):
             raise FileNotFoundError(f"Config file not found: {config_path}")
@@ -203,19 +211,17 @@ def parse_and_merge_config() -> Config:
         section_dc = config_field.type
         section_config = config_data.get(section_name, {})
         for field_info in fields(section_dc):
-            # Prioritize CLI args, then config file, then dataclass default
             value = cli_args_dict.get(field_info.name)
             if value is None:
                 value = section_config.get(field_info.name)
             
-            # Handle boolean flags from CLI correctly (store_true)
             if isinstance(value, bool) and value:
                  setattr(getattr(final_config, section_name), field_info.name, value)
             elif value is not None:
                  setattr(getattr(final_config, section_name), field_info.name, value)
 
     return final_config
-
+    
 # --- Core Application Logic ---
 
 def setup_video_io(cfg: IOParams, meta: Dict[str, Any]) -> Tuple[cv2.VideoCapture, cv2.VideoWriter]:
