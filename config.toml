@@ -1,19 +1,15 @@
 # config.toml
-# Example configuration file for cli.py.
 # Command-line arguments will override any settings defined here.
 
 [io]
-# source is required either here or on the command line.
-# source = "path/to/your/video.mp4" 
-# output = "outputs/processed_from_config.mp4"
 fps = 30.0 # Force output FPS to 30
-
-# NEW: Process only frames 300 to 900
+source = "data/input.mp4"
+output = "outputs/processed_with_viz.mp4"
 start_frame = 300
 end_frame = 900
 
 [detector]
-det = "yolov8s.pt" # Use a smaller, faster detector
+det = "yolov8s.pt"
 conf = 0.4
 imgsz = 640
 # classes = "0,2" # Example: track only persons (0) and cars (2)
@@ -38,6 +34,17 @@ conf_high = 0.6
 conf_low = 0.2
 
 [viz]
+# --- NEW VISUALIZATION MODES ---
+# Enable the scheduler reason codes on bounding boxes (e.g., [C-new], [R-due])
+viz_reasons = true
+
+# Enable the Heads-Up Display (HUD) with real-time stats
+viz_hud = true
+
+# Enable visualization for re-identification events
+viz_reid = true
+
+# --- Original settings ---
 draw_lost = true
 line_thickness = 1
 font_scale = 0.4

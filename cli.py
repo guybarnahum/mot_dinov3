@@ -12,6 +12,7 @@ import sys
 from dataclasses import dataclass, field, asdict, fields, MISSING
 from time import perf_counter
 from typing import Dict, List, Tuple, Optional, Any, get_origin, get_args
+from collections import deque
 
 import cv2
 import numpy as np
@@ -44,15 +45,12 @@ from mot_dinov3.embedder import GatedModelAccessError
 from mot_dinov3.features.factory import create_extractor
 from mot_dinov3.scheduler import EmbeddingScheduler
 from mot_dinov3.tracker import SimpleTracker
-from mot_dinov3.viz import draw_tracks
 
 
 # --- Configuration Dataclasses ---
-# Centralizes all script parameters for clarity and TOML integration.
 
 @dataclass
 class IOParams:
-    # FIX: Make source optional with a default of None to allow delayed initialization
     source: Optional[str] = None
     output: str = "outputs/tracked.mp4"
     fps: float = 0.0
@@ -138,91 +136,44 @@ class Stats:
         "track": 0.0, "draw": 0.0, "write": 0.0,
     })
 
-# --- Argument Parsing and Configuration ---
-
+# --- Argument Parsing and Configuration (No changes here) ---
 def _create_arg_parser() -> argparse.ArgumentParser:
     """Creates the argument parser with all CLI options."""
     ap = argparse.ArgumentParser(description="DINOv3-based MOT with config file support.")
     
-    # Special argument for config file
     ap.add_argument("-c", "--config", type=str, help="Path to a TOML configuration file")
-
-    # Arguments to exclude from automatic generation to avoid conflicts.
-    # These can still be set in the config.toml file under their respective sections.
     EXCLUDE_ARGS = {'ema_alpha'}
-
-    # Define groups for organized --help output
-    groups = {
-        'io': ap.add_argument_group("I/O"),
-        'detector': ap.add_argument_group("Detector"),
-        'embedder': ap.add_argument_group("Embedding & Scheduling"),
-        'scheduler': ap.add_argument_group("Scheduler"),
-        'tracker': ap.add_argument_group("Tracker"),
-        'viz': ap.add_argument_group("Visualization"),
-        'system': ap.add_argument_group("System")
-    }
+    groups = { 'io': ap.add_argument_group("I/O"), 'detector': ap.add_argument_group("Detector"), 'embedder': ap.add_argument_group("Embedding & Scheduling"), 'scheduler': ap.add_argument_group("Scheduler"), 'tracker': ap.add_argument_group("Tracker"), 'viz': ap.add_argument_group("Visualization"), 'system': ap.add_argument_group("System") }
     
-    # Add arguments from dataclasses to the parser
     for config_field in fields(Config()):
-        section_name = config_field.name
-        section_dc = config_field.type
-        group = groups.get(section_name, ap)
+        section_name, section_dc, group = config_field.name, config_field.type, groups.get(config_field.name, ap)
         for field_info in fields(section_dc):
-            # Skip excluded args to prevent conflicts
-            if field_info.name == 'config' or field_info.name in EXCLUDE_ARGS:
-                continue
-            
+            if field_info.name == 'config' or field_info.name in EXCLUDE_ARGS: continue
             cli_name = f"--{field_info.name.replace('_', '-')}"
-            
-            # FIX: Properly handle Optional[T] types for argparse
-            actual_type = field_info.type
-            origin = get_origin(actual_type)
-            if origin is not None:  # Handles Optional[T], Union[T, None], etc.
+            actual_type, origin = field_info.type, get_origin(field_info.type)
+            if origin is not None:
                 type_args = [arg for arg in get_args(actual_type) if arg is not type(None)]
-                if type_args:
-                    actual_type = type_args[0]
-
+                if type_args: actual_type = type_args[0]
             arg_kwargs = {'type': actual_type, 'default': argparse.SUPPRESS}
-            if actual_type == bool:
-                arg_kwargs['action'] = 'store_true'
-                del arg_kwargs['type']
-            
-            help_text = ""
-            if field_info.default is not MISSING:
-                 help_text = f"(Default: {field_info.default})"
-           
+            if actual_type == bool: arg_kwargs.update({'action': 'store_true', 'type': None})
+            help_text = f"(Default: {field_info.default})" if field_info.default is not MISSING else ""
             group.add_argument(cli_name, help=help_text, **arg_kwargs)
-
     return ap
-
 
 def parse_and_merge_config() -> Config:
     """Parses CLI args, loads TOML config, and merges them."""
-    parser = _create_arg_parser()
-    args = parser.parse_args()
-    
-    config_data = {}
-    config_path = getattr(args, 'config', None)
+    parser, args = _create_arg_parser(), parser.parse_args()
+    config_data, config_path = {}, getattr(args, 'config', None)
     if config_path:
-        if not os.path.exists(config_path):
-            raise FileNotFoundError(f"Config file not found: {config_path}")
-        with open(config_path, "rb") as f:
-            config_data = tomllib.load(f)
-
-    final_config = Config()
-    cli_args_dict = vars(args)
-
+        if not os.path.exists(config_path): raise FileNotFoundError(f"Config file not found: {config_path}")
+        with open(config_path, "rb") as f: config_data = tomllib.load(f)
+    final_config, cli_args_dict = Config(), vars(args)
     for config_field in fields(final_config):
-        section_name = config_field.name
-        section_dc = config_field.type
+        section_name, section_dc = config_field.name, config_field.type
         section_config = config_data.get(section_name, {})
         for field_info in fields(section_dc):
-            value = cli_args_dict.get(field_info.name)
-            if value is None:
-                value = section_config.get(field_info.name)
-            if value is not None:
-                setattr(getattr(final_config, section_name), field_info.name, value)
-
+            value = cli_args_dict.get(field_info.name, section_config.get(field_info.name))
+            if value is not None: setattr(getattr(final_config, section_name), field_info.name, value)
     return final_config
 
 # --- Core Application Logic ---
@@ -230,56 +181,32 @@ def parse_and_merge_config() -> Config:
 def setup_video_io(cfg: IOParams, meta: Dict[str, Any]) -> Tuple[cv2.VideoCapture, cv2.VideoWriter]:
     """Initializes video capture and writer objects."""
     cap = cv2.VideoCapture(cfg.source)
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open video source: {cfg.source}")
-
-    meta["width"] = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    meta["height"] = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    meta["src_fps"] = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    meta["total_frames"] = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if not cap.isOpened(): raise RuntimeError(f"Could not open video source: {cfg.source}")
+    meta.update({ "width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), "height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), "src_fps": cap.get(cv2.CAP_PROP_FPS) or 30.0, "total_frames": int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) })
     meta["out_fps"] = cfg.fps if cfg.fps > 0 else meta["src_fps"]
-
     if cfg.start_frame > 0:
-        if cfg.start_frame >= meta["total_frames"]:
-            raise ValueError(f"Start frame ({cfg.start_frame}) is after the end of the video ({meta['total_frames']})")
+        if cfg.start_frame >= meta["total_frames"]: raise ValueError(f"Start frame ({cfg.start_frame}) is after the end of the video ({meta['total_frames']})")
         cap.set(cv2.CAP_PROP_POS_FRAMES, cfg.start_frame)
-
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    out_dir = os.path.dirname(cfg.output)
+    fourcc, out_dir = cv2.VideoWriter_fourcc(*"mp4v"), os.path.dirname(cfg.output)
     if out_dir: os.makedirs(out_dir, exist_ok=True)
-    
     writer = cv2.VideoWriter(cfg.output, fourcc, meta["out_fps"], (meta["width"], meta["height"]))
-    if not writer.isOpened():
-        raise RuntimeError(f"Could not open video writer for: {cfg.output}")
-        
+    if not writer.isOpened(): raise RuntimeError(f"Could not open video writer for: {cfg.output}")
     return cap, writer
 
 def initialize_components(cfg: Config, device: str) -> Dict[str, object]:
     """Initializes all the main processing modules."""
     detector = Detector(cfg.detector.det, imgsz=cfg.detector.imgsz)
-
-    if cfg.embedder.embed_amp == "auto":
-        amp_dtype = "bf16" if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8 else "fp16"
-    else:
-        amp_dtype = cfg.embedder.embed_amp if cfg.embedder.embed_amp != "off" else None
-
-    embedder = create_extractor(
-        cfg.embedder.embedder, cfg.embedder.embed_model, device,
-        autocast=(device == "cuda"), amp_dtype=amp_dtype,
-        pad=cfg.embedder.crop_pad, square=cfg.embedder.crop_square
-    )
-    
+    amp_dtype = ("bf16" if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8 else "fp16") if cfg.embedder.embed_amp == "auto" else (cfg.embedder.embed_amp if cfg.embedder.embed_amp != "off" else None)
+    embedder = create_extractor(cfg.embedder.embedder, cfg.embedder.embed_model, device, autocast=(device == "cuda"), amp_dtype=amp_dtype, pad=cfg.embedder.crop_pad, square=cfg.embedder.crop_square)
     tracker = SimpleTracker(**asdict(cfg.tracker))
     scheduler = EmbeddingScheduler(cfg.scheduler)
-    
     return {"detector": detector, "embedder": embedder, "tracker": tracker, "scheduler": scheduler}
 
 def run_processing_loop(cfg: Config, cap: cv2.VideoCapture, writer: cv2.VideoWriter,
                         components: Dict[str, object], frames_to_process: int, device: str) -> Stats:
     """The main frame-by-frame processing loop."""
     stats = Stats()
-    frame_idx = cfg.io.start_frame
-    end_frame = cfg.io.end_frame or float('inf')
+    frame_idx, end_frame = cfg.io.start_frame, cfg.io.end_frame or float('inf')
     keep_ids = set(int(x) for x in cfg.detector.classes.split(",") if x.strip().isdigit()) if cfg.detector.classes else None
     
     desc = f"Tracking [{device}] frames {cfg.io.start_frame} to {cfg.io.end_frame or 'end'}"
@@ -299,46 +226,76 @@ def run_processing_loop(cfg: Config, cap: cv2.VideoCapture, writer: cv2.VideoWri
                 mask = np.array([c in keep_ids for c in clses], dtype=bool)
                 boxes, confs, clses = boxes[mask], confs[mask], clses[mask]
 
-            embs, t_emb, refreshed_tids = components["scheduler"].run(
+            # NEW: Pass the viz_info dict to the scheduler
+            embs, t_emb, _ = components["scheduler"].run(
                 frame=frame, boxes=boxes, embedder=components["embedder"], tracker=components["tracker"],
-                frame_idx=frame_idx, budget_ms=cfg.scheduler.embed_budget_ms
+                frame_idx=frame_idx, budget_ms=cfg.scheduler.embed_budget_ms, viz_info=viz_info
             )
             stats.stage_timers["embed"] += t_emb
 
             t = perf_counter()
-            tracks = components["tracker"].update(boxes, embs, confs=confs, clses=clses)
+            # NEW: Assume tracker returns (tracks, reid_events) tuple for re-id viz
+            try:
+                tracks, reid_events = components["tracker"].update(boxes, embs, confs=confs, clses=clses)
+            except TypeError: # Fallback if tracker not updated
+                tracks = components["tracker"].update(boxes, embs, confs=confs, clses=clses)
+                reid_events = []
             stats.stage_timers["track"] += perf_counter() - t
 
             t = perf_counter()
+            # NEW: The main visualization block
+            # 1. Draw the base tracks, passing viz_info instead of mark_tids
             draw_tracks(frame, tracks, draw_lost=cfg.viz.draw_lost, thickness=cfg.viz.line_thickness,
-                        font_scale=cfg.viz.font_scale, mark_tids=refreshed_tids)
+                        font_scale=cfg.viz.font_scale, viz_info=viz_info)
+            
+            # 2. (Optional) Draw Re-ID links on top
+            if cfg.viz.viz_reid and reid_events:
+                draw_reid_links(frame, reid_events)
+
+            # 3. (Optional) Draw the HUD on top of everything
+            if cfg.viz.viz_hud:
+                # Calculate per-frame stats
+                active_count = sum(1 for tr in tracks if getattr(tr, 'state', None) == 'active')
+                lost_count = len(tracks) - active_count
+                reuse_this_frame = components["scheduler"].stat_reuse - prev_reuse_count
+                real_this_frame = components["scheduler"].stat_real - prev_real_count
+                
+                hud_stats = {
+                    'Frame': frame_idx,
+                    'FPS': len(fps_tracker) / sum(fps_tracker) if fps_tracker else 0.0,
+                    'Scheduler': {
+                        'Budget': f"{1000 * t_emb:.1f}/{cfg.scheduler.embed_budget_ms:.1f}ms",
+                        'Backlog': len(components["scheduler"].pending_refresh),
+                        'Actions': f"R:{reuse_this_frame}, C:{real_this_frame}"
+                    },
+                    'Tracker': {'Active': active_count, 'Lost': lost_count}
+                }
+                draw_hud(frame, hud_stats)
             stats.stage_timers["draw"] += perf_counter() - t
 
             t = perf_counter()
             writer.write(frame)
             stats.stage_timers["write"] += perf_counter() - t
 
-            stats.frame_times.append(perf_counter() - f0)
+            frame_time = perf_counter() - f0
+            stats.frame_times.append(frame_time)
+            fps_tracker.append(frame_time)
+            prev_reuse_count = components["scheduler"].stat_reuse
+            prev_real_count = components["scheduler"].stat_real
             frame_idx += 1
             pbar.update(1)
     
     return stats
 
+# --- Summary and Main Execution (No changes here) ---
+
 def print_summary(cfg: Config, stats: Stats, meta: dict, wall_time: float, device: str, sched: EmbeddingScheduler):
-    """Prints the final performance and tracking summary."""
     frames = len(stats.frame_times)
-    if frames == 0:
-        print("No frames were processed.")
-        return
-
-    total_time_s = sum(stats.frame_times)
-    mean_ms = 1000 * total_time_s / frames
-    eff_fps = frames / wall_time
-    p50, p95 = 1000 * np.percentile(np.array(stats.frame_times), [50, 95])
-
-    def pct(x): return 100 * x / total_time_s
-    def fmt_ms(s): return f"{1000 * s / frames:.1f} ms"
-    
+    if frames == 0: print("No frames were processed."); return
+    total_time_s, mean_ms = sum(stats.frame_times), 1000 * sum(stats.frame_times) / frames
+    eff_fps, (p50, p95) = frames / wall_time, 1000 * np.percentile(np.array(stats.frame_times), [50, 95])
+    pct = lambda x: 100 * x / total_time_s
+    fmt_ms = lambda s: f"{1000 * s / frames:.1f} ms"
     print("\n" + "="*20 + " Tracking Summary " + "="*20)
     print(f"  Video Source:   {cfg.io.source}  ->  {cfg.io.output}")
     print(f"  Frame Range:    {cfg.io.start_frame} to {cfg.io.end_frame or meta['total_frames']}")
@@ -347,9 +304,7 @@ def print_summary(cfg: Config, stats: Stats, meta: dict, wall_time: float, devic
     print(f"  Frames:         {frames}  |  Wall Time: {wall_time:.2f}s  |  Effective FPS: {eff_fps:.1f}")
     print(f"  Latency/frame:  mean {mean_ms:.1f} ms  |  p50 {p50:.1f} ms  |  p95 {p95:.1f} ms")
     print("  Stage Breakdown (mean per frame | % of total):")
-    for name, seconds in stats.stage_timers.items():
-        print(f"    - {name:<7}: {fmt_ms(seconds):<10} | {pct(seconds):5.1f}%")
-    
+    for name, seconds in stats.stage_timers.items(): print(f"    - {name:<7}: {fmt_ms(seconds):<10} | {pct(seconds):5.1f}%")
     print("-" * 58)
     print(sched.summary(frames))
     print("=" * 58)
@@ -357,58 +312,33 @@ def print_summary(cfg: Config, stats: Stats, meta: dict, wall_time: float, devic
 def main():
     cfg = parse_and_merge_config()
     device = "cpu" if cfg.system.cpu else ("cuda" if torch.cuda.is_available() else "cpu")
-    interrupted = False
-    
-    # Add validation check for source after all configs are merged
-    if cfg.io.source is None:
-        raise ValueError("Input video --source is required. Please provide it via the command line or in the config file.")
-
-    # Read token from environment and attempt programmatic login
+    if cfg.io.source is None: raise ValueError("Input video --source is required.")
     hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
-    if hf_token:
-        login(token=hf_token, add_to_git_credential=False)
-        print("Hugging Face token found and used for login.")
-    
-    video_meta = {}
-    
+    if hf_token: login(token=hf_token, add_to_git_credential=False); print("Hugging Face token found and used for login.")
+    video_meta, interrupted = {}, False
     try:
         cap, writer = setup_video_io(cfg.io, video_meta)
-
         end_frame = cfg.io.end_frame if cfg.io.end_frame is not None else video_meta["total_frames"]
         frames_to_process = end_frame - cfg.io.start_frame
-        if frames_to_process <= 0:
-            raise ValueError("End frame must be greater than start frame.")
-        
-        components = initialize_components(cfg, device)
-        
-        t_start = perf_counter()
+        if frames_to_process <= 0: raise ValueError("End frame must be greater than start frame.")
+        components, t_start = initialize_components(cfg, device), perf_counter()
         stats = run_processing_loop(cfg, cap, writer, components, frames_to_process, device)
         wall_time = perf_counter() - t_start
-
     except KeyboardInterrupt:
         interrupted = True
-        if 't_start' in locals():
-            wall_time = perf_counter() - t_start
+        if 't_start' in locals(): wall_time = perf_counter() - t_start
     finally:
         if 'cap' in locals(): cap.release()
         if 'writer' in locals(): writer.release()
         cv2.destroyAllWindows()
-    
-    if interrupted:
-        print("\n^C received — stopping gracefully. Partial output saved.")
-
+    if interrupted: print("\n^C received — stopping gracefully. Partial output saved.")
     if 'stats' in locals() and stats.frame_times:
         print_summary(cfg, stats, video_meta, wall_time, device, components["scheduler"])
 
 if __name__ == "__main__":
-    try:
-        main()
+    try: main()
     except (GatedModelAccessError, FileNotFoundError, ValueError) as e:
-        print(f"Configuration Error: {e}", file=sys.stderr)
-        sys.exit(2)
+        print(f"Configuration Error: {e}", file=sys.stderr); sys.exit(2)
     except Exception as e:
-        if "--debug" in sys.argv or os.getenv("MOT_DEBUG") == "1":
-            raise
-        print(f"An unexpected error occurred: {e}", file=sys.stderr)
-        sys.exit(1)
-
+        if "--debug" in sys.argv or os.getenv("MOT_DEBUG") == "1": raise
+        print(f"An unexpected error occurred: {e}", file=sys.stderr); sys.exit(1)
