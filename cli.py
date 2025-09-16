@@ -45,6 +45,7 @@ from mot_dinov3.embedder import GatedModelAccessError
 from mot_dinov3.features.factory import create_extractor
 from mot_dinov3.scheduler import EmbeddingScheduler
 from mot_dinov3.tracker import SimpleTracker
+from mot_dinov3.viz import draw_tracks, draw_hud, draw_reid_links
 
 
 # --- Configuration Dataclasses ---
@@ -110,6 +111,9 @@ class VizParams:
     draw_lost: bool = False
     line_thickness: int = 2
     font_scale: float = 0.5
+    viz_reasons: bool = False
+    viz_hud: bool = False
+    viz_reid: bool = False
 
 @dataclass
 class SystemParams:
@@ -143,7 +147,15 @@ def _create_arg_parser() -> argparse.ArgumentParser:
     
     ap.add_argument("-c", "--config", type=str, help="Path to a TOML configuration file")
     EXCLUDE_ARGS = {'ema_alpha'}
-    groups = { 'io': ap.add_argument_group("I/O"), 'detector': ap.add_argument_group("Detector"), 'embedder': ap.add_argument_group("Embedding & Scheduling"), 'scheduler': ap.add_argument_group("Scheduler"), 'tracker': ap.add_argument_group("Tracker"), 'viz': ap.add_argument_group("Visualization"), 'system': ap.add_argument_group("System") }
+    groups = {
+        'io': ap.add_argument_group("I/O"),
+        'detector': ap.add_argument_group("Detector"),
+        'embedder': ap.add_argument_group("Embedding & Scheduling"),
+        'scheduler': ap.add_argument_group("Scheduler"),
+        'tracker': ap.add_argument_group("Tracker"),
+        'viz': ap.add_argument_group("Visualization"),
+        'system': ap.add_argument_group("System")
+    }
     
     for config_field in fields(Config()):
         section_name, section_dc, group = config_field.name, config_field.type, groups.get(config_field.name, ap)
@@ -154,10 +166,17 @@ def _create_arg_parser() -> argparse.ArgumentParser:
             if origin is not None:
                 type_args = [arg for arg in get_args(actual_type) if arg is not type(None)]
                 if type_args: actual_type = type_args[0]
+
             arg_kwargs = {'type': actual_type, 'default': argparse.SUPPRESS}
-            if actual_type == bool: arg_kwargs.update({'action': 'store_true', 'type': None})
+            
+            # --- THIS BLOCK IS THE FIX ---
+            if actual_type == bool:
+                arg_kwargs['action'] = 'store_true'
+                del arg_kwargs['type']  # Correctly remove the 'type' keyword for bools
+            
             help_text = f"(Default: {field_info.default})" if field_info.default is not MISSING else ""
             group.add_argument(cli_name, help=help_text, **arg_kwargs)
+            
     return ap
 
 def parse_and_merge_config() -> Config:
@@ -208,6 +227,12 @@ def run_processing_loop(cfg: Config, cap: cv2.VideoCapture, writer: cv2.VideoWri
     stats = Stats()
     frame_idx, end_frame = cfg.io.start_frame, cfg.io.end_frame or float('inf')
     keep_ids = set(int(x) for x in cfg.detector.classes.split(",") if x.strip().isdigit()) if cfg.detector.classes else None
+    
+    viz_info = {} if cfg.viz.viz_reasons else None
+    
+    # NEW: State for per-frame stats needed for the HUD
+    fps_tracker = deque(maxlen=30)
+    prev_reuse_count, prev_real_count = 0, 0
     
     desc = f"Tracking [{device}] frames {cfg.io.start_frame} to {cfg.io.end_frame or 'end'}"
     with tqdm(total=frames_to_process, unit="frame", dynamic_ncols=True, desc=desc) as pbar:

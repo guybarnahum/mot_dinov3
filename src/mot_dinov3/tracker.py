@@ -174,11 +174,15 @@ class SimpleTracker:
 
         N = len(det_boxes)
         # --- Stage 1: Associate ACTIVE tracks ---
+        if confs is not None:
+            hi_ids = [i for i, c in enumerate(confs) if c >= self.conf_high]
+            lo_ids = [i for i, c in enumerate(confs) if self.conf_low <= c < self.conf_high]
+        else:
+            hi_ids, lo_ids = list(range(N)), []
+
         act_idx = [i for i, t in enumerate(self.tracks) if t.state == "active"]
         unmatched_tracks = set(act_idx)
         
-        # Pass 1a: High-confidence detections
-        unmatched_hi, unmatched_tracks = self._match_active(act_idx, hi_ids, det_boxes, det_embs, clses, confs, use_iou_only=False)
         unmatched_hi, unmatched_tracks = self._match_active(list(unmatched_tracks), hi_ids, det_boxes, det_embs, clses, confs, use_iou_only=False)
         unmatched_lo, unmatched_tracks = self._match_active(list(unmatched_tracks), lo_ids, det_boxes, det_embs, clses, confs, use_iou_only=self.low_conf_iou_only)
         
@@ -186,7 +190,6 @@ class SimpleTracker:
         
         # --- Stage 2: Re-ID LOST tracks ---
         unmatched_dets = unmatched_hi.union(unmatched_lo)
-        self._reid_lost(sorted(list(unmatched_dets)), det_boxes, det_embs, clses, confs)
         
         # **NEW**: Pass unmatched_dets and reid_events to be modified in-place
         self._reid_lost(unmatched_dets, det_boxes, det_embs, clses, confs, reid_events)
@@ -197,7 +200,6 @@ class SimpleTracker:
             self._new_track(det_boxes[j], det_embs[j], cls)
 
         self._prune_removed()
-        return [t for t in self.tracks if t.state == "active"]
         
         # **NEW**: Return both active tracks and the re-id events
         active_tracks = [t for t in self.tracks if t.state == "active"]
