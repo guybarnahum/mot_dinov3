@@ -23,7 +23,6 @@ from tqdm.auto import tqdm
 # Load .env file for HF_TOKEN
 load_dotenv()
 
-# FIX: Import tomllib for Python 3.11+ and fall back to tomli
 try:
     import tomllib  # Standard library in Python 3.11+
 except ImportError:
@@ -34,7 +33,6 @@ except ImportError:
         print("Please run: pip install tomli", file=sys.stderr)
         sys.exit(1)
 
-# FIX: Add programmatic Hugging Face login
 from huggingface_hub import login
 
 from mot_dinov3 import compat
@@ -140,7 +138,7 @@ class Stats:
         "track": 0.0, "draw": 0.0, "write": 0.0,
     })
 
-# --- Argument Parsing and Configuration (No changes here) ---
+# --- Argument Parsing and Configuration ---
 def _create_arg_parser() -> argparse.ArgumentParser:
     """Creates the argument parser with all CLI options."""
     ap = argparse.ArgumentParser(description="DINOv3-based MOT with config file support.")
@@ -150,7 +148,7 @@ def _create_arg_parser() -> argparse.ArgumentParser:
     groups = {
         'io': ap.add_argument_group("I/O"),
         'detector': ap.add_argument_group("Detector"),
-        'embedder': ap.add_argument_group("Embedding & Scheduling"),
+        'embedder': ap.add_argument_group("Embedding"),
         'scheduler': ap.add_argument_group("Scheduler"),
         'tracker': ap.add_argument_group("Tracker"),
         'viz': ap.add_argument_group("Visualization"),
@@ -158,10 +156,14 @@ def _create_arg_parser() -> argparse.ArgumentParser:
     }
     
     for config_field in fields(Config()):
-        section_name, section_dc, group = config_field.name, config_field.type, groups.get(config_field.name, ap)
+        section_dc = config_field.type
+        group = groups.get(config_field.name, ap)
         for field_info in fields(section_dc):
-            if field_info.name == 'config' or field_info.name in EXCLUDE_ARGS: continue
+            if field_info.name in EXCLUDE_ARGS: continue
+            
             cli_name = f"--{field_info.name.replace('_', '-')}"
+            
+            # Unpack Optional[T] types
             actual_type, origin = field_info.type, get_origin(field_info.type)
             if origin is not None:
                 type_args = [arg for arg in get_args(actual_type) if arg is not type(None)]
@@ -169,20 +171,30 @@ def _create_arg_parser() -> argparse.ArgumentParser:
 
             arg_kwargs = {'type': actual_type, 'default': argparse.SUPPRESS}
             
-            # --- THIS BLOCK IS THE FIX ---
+            # --- ENHANCED: Correctly handle boolean flags based on their default value ---
             if actual_type == bool:
-                arg_kwargs['action'] = 'store_true'
-                del arg_kwargs['type']  # Correctly remove the 'type' keyword for bools
+                if field_info.default is True:
+                    # For flags that default to True, create a '--no-' version
+                    cli_name = f"--no-{field_info.name.replace('_', '-')}"
+                    arg_kwargs['action'] = 'store_false'
+                    arg_kwargs['dest'] = field_info.name # Ensure it maps to the correct attribute
+                else:
+                    arg_kwargs['action'] = 'store_true'
+                del arg_kwargs['type']
             
-            help_text = f"(Default: {field_info.default})" if field_info.default is not MISSING else ""
+            help_text = f" " # Add a space for alignment
+            if field_info.default is not MISSING and actual_type != bool:
+                 help_text += f"(Default: {field_info.default})"
+           
             group.add_argument(cli_name, help=help_text, **arg_kwargs)
             
     return ap
 
+
 def parse_and_merge_config() -> Config:
     """
     Parses CLI args, loads TOML config, and merges them.
-    NEW: Automatically loads 'config.toml' if it exists and --config is not specified.
+    Automatically loads 'config.toml' if it exists and --config is not specified.
     """
     parser = _create_arg_parser()
     args = parser.parse_args()
@@ -190,12 +202,9 @@ def parse_and_merge_config() -> Config:
     config_data = {}
     config_path = getattr(args, 'config', None)
     
-    # --- THIS BLOCK IS THE IMPROVEMENT ---
-    # If no config path is given via CLI, check for a default 'config.toml'
     if config_path is None and os.path.exists("config.toml"):
-        print("Found 'config.toml' in the current directory, loading it by default.")
+        print("💡 Found 'config.toml', loading it as the base configuration.")
         config_path = "config.toml"
-    # ------------------------------------
 
     if config_path:
         if not os.path.exists(config_path):
@@ -211,14 +220,16 @@ def parse_and_merge_config() -> Config:
         section_dc = config_field.type
         section_config = config_data.get(section_name, {})
         for field_info in fields(section_dc):
+            # CLI arguments take highest priority
             value = cli_args_dict.get(field_info.name)
+            
+            # If not in CLI, take from TOML file
             if value is None:
                 value = section_config.get(field_info.name)
             
-            if isinstance(value, bool) and value:
-                 setattr(getattr(final_config, section_name), field_info.name, value)
-            elif value is not None:
-                 setattr(getattr(final_config, section_name), field_info.name, value)
+            # If a value was found from either source, set it
+            if value is not None:
+                setattr(getattr(final_config, section_name), field_info.name, value)
 
     return final_config
     
@@ -255,11 +266,8 @@ def run_processing_loop(cfg: Config, cap: cv2.VideoCapture, writer: cv2.VideoWri
     frame_idx, end_frame = cfg.io.start_frame, cfg.io.end_frame or float('inf')
     keep_ids = set(int(x) for x in cfg.detector.classes.split(",") if x.strip().isdigit()) if cfg.detector.classes else None
     
-    viz_info = {} if cfg.viz.viz_reasons else None
-    
-    # NEW: State for per-frame stats needed for the HUD
+    # State for per-frame stats needed for the HUD
     fps_tracker = deque(maxlen=30)
-    prev_reuse_count, prev_real_count = 0, 0
     
     desc = f"Tracking [{device}] frames {cfg.io.start_frame} to {cfg.io.end_frame or 'end'}"
     with tqdm(total=frames_to_process, unit="frame", dynamic_ncols=True, desc=desc) as pbar:
@@ -270,6 +278,8 @@ def run_processing_loop(cfg: Config, cap: cv2.VideoCapture, writer: cv2.VideoWri
             stats.stage_timers["read"] += perf_counter() - t
             if not ok: break
 
+            viz_info = {} if cfg.viz.viz_reasons else None
+
             t = perf_counter()
             boxes, confs, clses = components["detector"].detect(frame, conf_thres=cfg.detector.conf)
             stats.stage_timers["detect"] += perf_counter() - t
@@ -278,7 +288,7 @@ def run_processing_loop(cfg: Config, cap: cv2.VideoCapture, writer: cv2.VideoWri
                 mask = np.array([c in keep_ids for c in clses], dtype=bool)
                 boxes, confs, clses = boxes[mask], confs[mask], clses[mask]
 
-            # NEW: Pass the viz_info dict to the scheduler
+            components["scheduler"].reset_stats() # Reset per-frame stats for HUD
             embs, t_emb, _ = components["scheduler"].run(
                 frame=frame, boxes=boxes, embedder=components["embedder"], tracker=components["tracker"],
                 frame_idx=frame_idx, budget_ms=cfg.scheduler.embed_budget_ms, viz_info=viz_info
@@ -286,16 +296,10 @@ def run_processing_loop(cfg: Config, cap: cv2.VideoCapture, writer: cv2.VideoWri
             stats.stage_timers["embed"] += t_emb
 
             t = perf_counter()
-            # NEW: Assume tracker returns (tracks, reid_events) tuple for re-id viz
-            try:
-                tracks, reid_events = components["tracker"].update(boxes, embs, confs=confs, clses=clses)
-            except TypeError: # Fallback if tracker not updated
-                tracks = components["tracker"].update(boxes, embs, confs=confs, clses=clses)
-                reid_events = []
+            tracks, reid_events = components["tracker"].update(boxes, embs, confs=confs, clses=clses)
             stats.stage_timers["track"] += perf_counter() - t
 
             t = perf_counter()
-            # NEW: The main visualization block
             # 1. Draw the base tracks, passing viz_info instead of mark_tids
             draw_tracks(frame, tracks, draw_lost=cfg.viz.draw_lost, thickness=cfg.viz.line_thickness,
                         font_scale=cfg.viz.font_scale, viz_info=viz_info)
@@ -309,8 +313,6 @@ def run_processing_loop(cfg: Config, cap: cv2.VideoCapture, writer: cv2.VideoWri
                 # Calculate per-frame stats
                 active_count = sum(1 for tr in tracks if getattr(tr, 'state', None) == 'active')
                 lost_count = len(tracks) - active_count
-                reuse_this_frame = components["scheduler"].stat_reuse - prev_reuse_count
-                real_this_frame = components["scheduler"].stat_real - prev_real_count
                 
                 hud_stats = {
                     'Frame': frame_idx,
@@ -318,7 +320,7 @@ def run_processing_loop(cfg: Config, cap: cv2.VideoCapture, writer: cv2.VideoWri
                     'Scheduler': {
                         'Budget': f"{1000 * t_emb:.1f}/{cfg.scheduler.embed_budget_ms:.1f}ms",
                         'Backlog': len(components["scheduler"].pending_refresh),
-                        'Actions': f"R:{reuse_this_frame}, C:{real_this_frame}"
+                        'Actions': f"C:{components['scheduler'].stat_real}, R:{components['scheduler'].stat_reuse}"
                     },
                     'Tracker': {'Active': active_count, 'Lost': lost_count}
                 }
@@ -329,17 +331,12 @@ def run_processing_loop(cfg: Config, cap: cv2.VideoCapture, writer: cv2.VideoWri
             writer.write(frame)
             stats.stage_timers["write"] += perf_counter() - t
 
-            frame_time = perf_counter() - f0
-            stats.frame_times.append(frame_time)
-            fps_tracker.append(frame_time)
-            prev_reuse_count = components["scheduler"].stat_reuse
-            prev_real_count = components["scheduler"].stat_real
+            stats.frame_times.append(perf_counter() - f0)
+            fps_tracker.append(perf_counter() - f0)
             frame_idx += 1
             pbar.update(1)
     
     return stats
-
-# --- Summary and Main Execution (No changes here) ---
 
 def print_summary(cfg: Config, stats: Stats, meta: dict, wall_time: float, device: str, sched: EmbeddingScheduler):
     frames = len(stats.frame_times)
@@ -358,6 +355,9 @@ def print_summary(cfg: Config, stats: Stats, meta: dict, wall_time: float, devic
     print("  Stage Breakdown (mean per frame | % of total):")
     for name, seconds in stats.stage_timers.items(): print(f"    - {name:<7}: {fmt_ms(seconds):<10} | {pct(seconds):5.1f}%")
     print("-" * 58)
+    # Get total embedding stats for the whole run, not per-frame
+    total_scheduler = components['scheduler']
+    total_scheduler.stat_real = sum(s.stage_timers['embed'] for s in [stats]) # This is a bit of a hack
     print(sched.summary(frames))
     print("=" * 58)
 
@@ -366,8 +366,10 @@ def main():
     device = "cpu" if cfg.system.cpu else ("cuda" if torch.cuda.is_available() else "cpu")
     if cfg.io.source is None: raise ValueError("Input video --source is required.")
     hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
-    if hf_token: login(token=hf_token, add_to_git_credential=False); print("Hugging Face token found and used for login.")
+    if hf_token: login(token=hf_token, add_to_git_credential=False); print("💡 Hugging Face token found and used for programmatic login.")
     video_meta, interrupted = {}, False
+    components = {} # Ensure components is defined in the outer scope
+    
     try:
         cap, writer = setup_video_io(cfg.io, video_meta)
         end_frame = cfg.io.end_frame if cfg.io.end_frame is not None else video_meta["total_frames"]
@@ -394,3 +396,4 @@ if __name__ == "__main__":
     except Exception as e:
         if "--debug" in sys.argv or os.getenv("MOT_DEBUG") == "1": raise
         print(f"An unexpected error occurred: {e}", file=sys.stderr); sys.exit(1)
+

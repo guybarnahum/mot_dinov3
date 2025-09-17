@@ -24,17 +24,18 @@ crop_pad = 0.1
 embed_model = "facebook/dinov3-vits16-pretrain-lvd1689m"
 
 [scheduler]
-refresh_every = 10
+refresh_every = 30
 iou_gate = 0.7
 
 [tracker]
-max_age = 45
+max_age = 60
+reid_max_age = 300
 reid_sim_thresh = 0.65
 conf_high = 0.6
-conf_low = 0.2
+conf_low = 0.15
 
 [viz]
-# --- NEW VISUALIZATION MODES ---
+# --- VISUALIZATION MODES ---
 # Enable the scheduler reason codes on bounding boxes (e.g., [C-new], [R-due])
 viz_reasons = true
 
@@ -46,8 +47,8 @@ viz_reid = true
 
 # --- Original settings ---
 draw_lost = true
-line_thickness = 1
-font_scale = 0.4
+line_thickness = 2
+font_scale = 0.5
 
 [system]
 # cpu = true # Uncomment to force CPU processing

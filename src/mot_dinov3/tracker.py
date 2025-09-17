@@ -111,6 +111,9 @@ class SimpleTracker:
         
         self.tracks: List[Track] = []
         self._next_id = 1
+        # --- ENHANCEMENT: Add a list to store Re-ID events for the current frame ---
+        self.reid_events_this_frame: List[Dict] = []
+
 
     def _new_track(self, box: np.ndarray, emb: np.ndarray, cls: Optional[int]) -> Track:
         t = Track(tid=self._next_id, box=box, emb=emb, cls=cls if (cls is not None and cls >= 0) else None,
@@ -169,8 +172,8 @@ class SimpleTracker:
     def update(self, det_boxes: np.ndarray, det_embs: np.ndarray,
                confs: Optional[np.ndarray] = None, clses: Optional[np.ndarray] = None) -> Tuple[List[Track], List[Dict]]:
         
-        # **NEW**: Initialize list to store re-id visualization events
-        reid_events = []
+        # --- ENHANCEMENT: Clear the Re-ID event list at the start of each frame ---
+        self.reid_events_this_frame.clear()
 
         N = len(det_boxes)
         # --- Stage 1: Associate ACTIVE tracks ---
@@ -191,8 +194,8 @@ class SimpleTracker:
         # --- Stage 2: Re-ID LOST tracks ---
         unmatched_dets = unmatched_hi.union(unmatched_lo)
         
-        # **NEW**: Pass unmatched_dets and reid_events to be modified in-place
-        self._reid_lost(unmatched_dets, det_boxes, det_embs, clses, confs, reid_events)
+        # Pass the list to be populated by the function
+        self._reid_lost(unmatched_dets, det_boxes, det_embs, clses, confs, self.reid_events_this_frame)
 
         # --- Stage 3: Create new tracks ---
         for j in sorted(list(unmatched_dets)):
@@ -201,9 +204,9 @@ class SimpleTracker:
 
         self._prune_removed()
         
-        # **NEW**: Return both active tracks and the re-id events
-        active_tracks = [t for t in self.tracks if t.state == "active"]
-        return active_tracks, reid_events
+        # Return a copy of the tracks and the populated event list
+        active_and_lost_tracks = [t for t in self.tracks]
+        return active_and_lost_tracks, self.reid_events_this_frame
 
     def _match_active(self, act_idx, det_ids, boxes, embs, clses, confs, use_iou_only=False):
         unmatched_dets, unmatched_tracks = set(det_ids), set(act_idx)
@@ -256,7 +259,7 @@ class SimpleTracker:
                     rows.append(r); cols.append(c)
                     used_r.add(r); used_c.add(c)
 
-        # **NEW**: This loop now creates re-id events and updates tracks
+        # --- ENHANCEMENT: This loop now creates Re-ID events ---
         for r, c in zip(rows, cols):
             if cost_matrix[r, c] >= 1e6: continue
 
@@ -264,7 +267,7 @@ class SimpleTracker:
             j = det_left[c]
             track = self.tracks[ti]
             
-            # Create the event dictionary BEFORE the track is updated
+            # Create the event dictionary BEFORE the track is updated for accurate visualization
             event = {
                 "tid": track.tid,
                 "old_box": track.box.copy(),
@@ -273,7 +276,7 @@ class SimpleTracker:
             }
             reid_events.append(event)
             
-            # Update the track with the new detection info
+            # Update the track with the new detection info, reactivating it
             track.update(
                 boxes[j], embs[j],
                 det_conf=(confs[j] if confs is not None else 1.0),
@@ -282,5 +285,6 @@ class SimpleTracker:
                 class_vote_smoothing=self.class_vote_smoothing, class_decay_factor=self.class_decay_factor
             )
             
-            # **FIX**: Remove the detection from the unmatched set so it's not used again
+            # Remove the detection from the unmatched set so it's not used to create a new track
             unmatched_dets.remove(j)
+
