@@ -144,7 +144,9 @@ def _create_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="DINOv3-based MOT with config file support.")
     
     ap.add_argument("-c", "--config", type=str, help="Path to a TOML configuration file")
-    EXCLUDE_ARGS = {'ema_alpha','config'}
+    
+    EXCLUDE_ARGS = {'ema_alpha', 'config'}
+    
     groups = {
         'io': ap.add_argument_group("I/O"),
         'detector': ap.add_argument_group("Detector"),
@@ -163,7 +165,6 @@ def _create_arg_parser() -> argparse.ArgumentParser:
             
             cli_name = f"--{field_info.name.replace('_', '-')}"
             
-            # Unpack Optional[T] types
             actual_type, origin = field_info.type, get_origin(field_info.type)
             if origin is not None:
                 type_args = [arg for arg in get_args(actual_type) if arg is not type(None)]
@@ -171,18 +172,16 @@ def _create_arg_parser() -> argparse.ArgumentParser:
 
             arg_kwargs = {'type': actual_type, 'default': argparse.SUPPRESS}
             
-            # --- ENHANCED: Correctly handle boolean flags based on their default value ---
             if actual_type == bool:
                 if field_info.default is True:
-                    # For flags that default to True, create a '--no-' version
                     cli_name = f"--no-{field_info.name.replace('_', '-')}"
                     arg_kwargs['action'] = 'store_false'
-                    arg_kwargs['dest'] = field_info.name # Ensure it maps to the correct attribute
+                    arg_kwargs['dest'] = field_info.name
                 else:
                     arg_kwargs['action'] = 'store_true'
                 del arg_kwargs['type']
             
-            help_text = f" " # Add a space for alignment
+            help_text = f" "
             if field_info.default is not MISSING and actual_type != bool:
                  help_text += f"(Default: {field_info.default})"
            
@@ -266,8 +265,10 @@ def run_processing_loop(cfg: Config, cap: cv2.VideoCapture, writer: cv2.VideoWri
     frame_idx, end_frame = cfg.io.start_frame, cfg.io.end_frame or float('inf')
     keep_ids = set(int(x) for x in cfg.detector.classes.split(",") if x.strip().isdigit()) if cfg.detector.classes else None
     
-    # State for per-frame stats needed for the HUD
     fps_tracker = deque(maxlen=30)
+    
+    # FIX: Track scheduler stats per-frame for the HUD
+    prev_reuse_count, prev_real_count = 0, 0
     
     desc = f"Tracking [{device}] frames {cfg.io.start_frame} to {cfg.io.end_frame or 'end'}"
     with tqdm(total=frames_to_process, unit="frame", dynamic_ncols=True, desc=desc) as pbar:
@@ -287,8 +288,8 @@ def run_processing_loop(cfg: Config, cap: cv2.VideoCapture, writer: cv2.VideoWri
             if keep_ids and len(boxes) > 0:
                 mask = np.array([c in keep_ids for c in clses], dtype=bool)
                 boxes, confs, clses = boxes[mask], confs[mask], clses[mask]
-
-            components["scheduler"].reset_stats() # Reset per-frame stats for HUD
+            
+            # NOTE: We no longer reset scheduler stats here. It now accumulates totals.
             embs, t_emb, _ = components["scheduler"].run(
                 frame=frame, boxes=boxes, embedder=components["embedder"], tracker=components["tracker"],
                 frame_idx=frame_idx, budget_ms=cfg.scheduler.embed_budget_ms, viz_info=viz_info
@@ -313,13 +314,16 @@ def run_processing_loop(cfg: Config, cap: cv2.VideoCapture, writer: cv2.VideoWri
                 active_count = sum(1 for tr in tracks if getattr(tr, 'state', None) == 'active')
                 lost_count = len(tracks) - active_count
                 
+                reuse_this_frame = components["scheduler"].stat_reuse - prev_reuse_count
+                real_this_frame = components["scheduler"].stat_real - prev_real_count
+                
                 hud_stats = {
                     'Frame': frame_idx,
                     'FPS': len(fps_tracker) / sum(fps_tracker) if fps_tracker else 0.0,
                     'Scheduler': {
                         'Budget': f"{1000 * t_emb:.1f}/{cfg.scheduler.embed_budget_ms:.1f}ms",
                         'Backlog': len(components["scheduler"].pending_refresh),
-                        'Actions': f"C:{components['scheduler'].stat_real}, R:{components['scheduler'].stat_reuse}"
+                        'Actions': f"C:{real_this_frame}, R:{reuse_this_frame}"
                     },
                     'Tracker': {'Active': active_count, 'Lost': lost_count}
                 }
@@ -332,17 +336,23 @@ def run_processing_loop(cfg: Config, cap: cv2.VideoCapture, writer: cv2.VideoWri
 
             stats.frame_times.append(perf_counter() - f0)
             fps_tracker.append(perf_counter() - f0)
+            
+            # FIX: Update previous stat counts for the next frame's HUD
+            prev_reuse_count = components["scheduler"].stat_reuse
+            prev_real_count = components["scheduler"].stat_real
+
             frame_idx += 1
             pbar.update(1)
     
     return stats
+
 
 def print_summary(cfg: Config, stats: Stats, meta: dict, wall_time: float, device: str, sched: EmbeddingScheduler):
     frames = len(stats.frame_times)
     if frames == 0: print("No frames were processed."); return
     total_time_s, mean_ms = sum(stats.frame_times), 1000 * sum(stats.frame_times) / frames
     eff_fps, (p50, p95) = frames / wall_time, 1000 * np.percentile(np.array(stats.frame_times), [50, 95])
-    pct = lambda x: 100 * x / total_time_s
+    pct = lambda x: 100 * x / total_time_s if total_time_s > 0 else 0
     fmt_ms = lambda s: f"{1000 * s / frames:.1f} ms"
     print("\n" + "="*20 + " Tracking Summary " + "="*20)
     print(f"  Video Source:   {cfg.io.source}  ->  {cfg.io.output}")
@@ -354,9 +364,9 @@ def print_summary(cfg: Config, stats: Stats, meta: dict, wall_time: float, devic
     print("  Stage Breakdown (mean per frame | % of total):")
     for name, seconds in stats.stage_timers.items(): print(f"    - {name:<7}: {fmt_ms(seconds):<10} | {pct(seconds):5.1f}%")
     print("-" * 58)
-    # Get total embedding stats for the whole run, not per-frame
-    total_scheduler = components['scheduler']
-    total_scheduler.stat_real = sum(s.stage_timers['embed'] for s in [stats]) # This is a bit of a hack
+    
+    # FIX: Remove direct access to 'components'. The 'sched' object passed in
+    # now holds the correct, accumulated totals for the entire run.
     print(sched.summary(frames))
     print("=" * 58)
 
@@ -367,7 +377,7 @@ def main():
     hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
     if hf_token: login(token=hf_token, add_to_git_credential=False); print("💡 Hugging Face token found and used for programmatic login.")
     video_meta, interrupted = {}, False
-    components = {} # Ensure components is defined in the outer scope
+    components = {} 
     
     try:
         cap, writer = setup_video_io(cfg.io, video_meta)
