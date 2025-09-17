@@ -310,7 +310,6 @@ def run_processing_loop(cfg: Config, cap: cv2.VideoCapture, writer: cv2.VideoWri
 
             # 3. (Optional) Draw the HUD on top of everything
             if cfg.viz.viz_hud:
-                # Calculate per-frame stats
                 active_count = sum(1 for tr in tracks if getattr(tr, 'state', None) == 'active')
                 lost_count = len(tracks) - active_count
                 
