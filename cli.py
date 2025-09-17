@@ -144,7 +144,7 @@ def _create_arg_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(description="DINOv3-based MOT with config file support.")
     
     ap.add_argument("-c", "--config", type=str, help="Path to a TOML configuration file")
-    EXCLUDE_ARGS = {'ema_alpha'}
+    EXCLUDE_ARGS = {'ema_alpha','config'}
     groups = {
         'io': ap.add_argument_group("I/O"),
         'detector': ap.add_argument_group("Detector"),
