@@ -56,17 +56,13 @@ extrapolation_window = 180
 # --- End of Re-ID Heuristics ---
 
 [viz]
-# --- VISUALIZATION MODES ---
-# Enable the scheduler reason codes on bounding boxes (e.g., [C-new], [R-due])
-viz_reasons = true
+# --- Enable all advanced visualizations ---
+viz_reasons = true    # Show scheduler reasons on bbox labels
+viz_hud = true        # Show the real-time statistics HUD
+viz_reid = true       # Show enhanced Re-ID event links
+viz_trails = true     # Show a short, fading path for each active track
+viz_prediction = true # Show a predicted motion vector for lost tracks
 
-# Enable the Heads-Up Display (HUD) with real-time stats
-viz_hud = true
-
-# Enable visualization for re-identification events (draws a line from old to new position)
-viz_reid = true
-
-# --- Original settings ---
 # Show lost tracks as dashed boxes so you can see what the tracker is trying to find.
 draw_lost = true
 line_thickness = 2
