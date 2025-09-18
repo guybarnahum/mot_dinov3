@@ -24,31 +24,54 @@ crop_pad = 0.1
 embed_model = "facebook/dinov3-vits16-pretrain-lvd1689m"
 
 [scheduler]
+# Refresh embeddings less frequently to focus budget on new/lost tracks.
 refresh_every = 30
 iou_gate = 0.7
 
 [tracker]
+# Keep ACTIVE tracks for 1 sec (60 frames @ 60fps) before they become LOST.
 max_age = 60
+# Keep LOST tracks for 5 sec (300 frames @ 60fps) for Re-ID attempts.
 reid_max_age = 300
+# Similarity threshold to confirm a Re-ID match.
 reid_sim_thresh = 0.65
+# Only update a track's reference embedding with confident detections.
+conf_min_update = 0.4
 conf_high = 0.6
 conf_low = 0.15
 
+# --- NEW: Advanced Re-ID Heuristics ---
+# Master switch for motion-based filtering. To disable all motion filtering for
+# a global, appearance-only Re-ID search, use the '--no-motion-gate' flag
+# or set this to false.
+motion_gate = true
+
+# For the first 30 frames a track is lost, the tracker will search for it
+# near its predicted position (extrapolated from its last known velocity).
+# The search radius grows over time as defined by center_gate_base/slope.
+extrapolation_window = 180
+
+# After 'extrapolation_window' frames, the tracker assumes the motion prediction
+# is unreliable and switches to a global, appearance-only search for that track.
+# --- End of New Heuristics ---
+
 [viz]
-# --- VISUALIZATION MODES ---
+# --- NEW VISUALIZATION MODES ---
 # Enable the scheduler reason codes on bounding boxes (e.g., [C-new], [R-due])
 viz_reasons = true
 
 # Enable the Heads-Up Display (HUD) with real-time stats
 viz_hud = true
 
-# Enable visualization for re-identification events
+# Enable visualization for re-identification events (draws a line from old to new position)
 viz_reid = true
 
 # --- Original settings ---
+# Show lost tracks as dashed boxes so you can see what the tracker is trying to find.
 draw_lost = true
 line_thickness = 2
 font_scale = 0.5
 
 [system]
 # cpu = true # Uncomment to force CPU processing
+
