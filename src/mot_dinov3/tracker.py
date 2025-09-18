@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set, Tuple
+from collections import deque
 
 import numpy as np
 
@@ -29,24 +30,28 @@ class Track:
     gallery_max: int = 10
     cls_hist: Dict[int, float] = field(default_factory=dict, repr=False)
     last_conf: float = 0.0
-    # --- ENHANCED: Add center and velocity for motion extrapolation ---
     center: np.ndarray = field(init=False)
     velocity: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0]), repr=False)
+    # --- ENHANCED: Add position history for drawing trails ---
+    center_history: deque = field(default_factory=lambda: deque(maxlen=25), repr=False)
+
 
     def __post_init__(self):
         self.center = utils.centers_xyxy(self.box[np.newaxis, :])[0]
+        self.center_history.append(self.center.astype(int))
 
     def update(self, box: np.ndarray, emb: np.ndarray,
                det_conf: float = 1.0, det_cls: Optional[int] = None,
                conf_min_update: float = 0.3, conf_update_weight: float = 0.5,
                class_vote_smoothing: float = 0.6, class_decay_factor: float = 0.05):
         
-        # --- ENHANCED: Update center and velocity with EMA smoothing ---
         old_center = self.center
         self.center = utils.centers_xyxy(box[np.newaxis, :])[0]
         velocity = self.center - old_center
-        self.velocity = 0.7 * self.velocity + 0.3 * velocity # EMA smoothing
-        # --- END ENHANCEMENT ---
+        self.velocity = 0.7 * self.velocity + 0.3 * velocity 
+        
+        # --- ENHANCED: Append new position to the history ---
+        self.center_history.append(self.center.astype(int))
 
         self.box = box.astype(np.float32)
 
@@ -113,7 +118,6 @@ class SimpleTracker:
         self.center_gate_slope = kwargs.get('center_gate_slope', 10.0)
         self.class_vote_smoothing = kwargs.get('class_vote_smoothing', 0.6)
         self.class_decay_factor = kwargs.get('class_decay_factor', 0.05)
-        # --- ENHANCED: Added new parameters for motion heuristics ---
         self.motion_gate = kwargs.get('motion_gate', True)
         self.extrapolation_window = kwargs.get('extrapolation_window', 30)
         
@@ -214,9 +218,7 @@ class SimpleTracker:
         # --- ENHANCED: Split lost tracks into two groups for staged search ---
         lost_idx = [i for i, t in enumerate(self.tracks) if t.state == "lost"]
         
-        # Correctly get the track objects for filtering
         lost_tracks_all = [self.tracks[i] for i in lost_idx]
-        
         lost_gated_idx = [i for i, t in zip(lost_idx, lost_tracks_all) if t.time_since_update <= self.extrapolation_window]
         lost_global_idx = [i for i, t in zip(lost_idx, lost_tracks_all) if t.time_since_update > self.extrapolation_window]
         
@@ -224,12 +226,10 @@ class SimpleTracker:
         det_left_ids = sorted(list(unmatched_dets))
         if lost_gated_idx and det_left_ids:
             lost_tracks = [self.tracks[i] for i in lost_gated_idx]
-            det_boxes = boxes[det_left_ids]
-            det_embs = embs[det_left_ids]
+            det_boxes, det_embs = boxes[det_left_ids], embs[det_left_ids]
             cost_app = utils.cosine_cost_matrix(np.stack([t.emb for t in lost_tracks]), det_embs)
             cost_matrix = cost_app.copy()
             cost_matrix[cost_app > (1.0 - self.reid_sim_thresh)] = 1e6
-
             if self.motion_gate:
                 time_since = np.array([t.time_since_update for t in lost_tracks])
                 pred_centers = np.stack([t.center for t in lost_tracks]) + np.stack([t.velocity for t in lost_tracks]) * time_since[:, np.newaxis]
@@ -237,7 +237,6 @@ class SimpleTracker:
                 dist = np.linalg.norm(pred_centers[:, np.newaxis, :] - det_centers[np.newaxis, :, :], axis=2)
                 allowance = self.center_gate_base + self.center_gate_slope * time_since
                 cost_matrix[dist > allowance[:, np.newaxis]] = 1e6
-
             unmatched_lost_gated = set(range(len(lost_gated_idx)))
             self._associate(cost_matrix, unmatched_dets, unmatched_lost_gated, lost_gated_idx, det_left_ids, boxes, embs, clses, confs, is_reid=True)
         
@@ -245,12 +244,9 @@ class SimpleTracker:
         det_left_ids = sorted(list(unmatched_dets))
         if lost_global_idx and det_left_ids:
             lost_tracks = [self.tracks[i] for i in lost_global_idx]
-            det_boxes = boxes[det_left_ids]
             det_embs = embs[det_left_ids]
             cost_app = utils.cosine_cost_matrix(np.stack([t.emb for t in lost_tracks]), det_embs)
             cost_matrix = cost_app.copy()
             cost_matrix[cost_app > (1.0 - self.reid_sim_thresh)] = 1e6
-            
             unmatched_lost_global = set(range(len(lost_global_idx)))
             self._associate(cost_matrix, unmatched_dets, unmatched_lost_global, lost_global_idx, det_left_ids, boxes, embs, clses, confs, is_reid=True)
-
