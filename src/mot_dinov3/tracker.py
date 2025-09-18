@@ -190,29 +190,21 @@ class SimpleTracker:
         for j in sorted(list(unmatched_dets)):
             cls = int(clses[j]) if clses is not None else None
             self._new_track(det_boxes[j], det_embs[j], cls)
-
         self._prune_removed()
-        
-        # Return a copy of the tracks and the populated event list
-        active_and_lost_tracks = [t for t in self.tracks]
-        return active_and_lost_tracks, self.reid_events_this_frame
+        return self.tracks, self.reid_events_this_frame
 
     def _match_active(self, act_idx, det_ids, boxes, embs, clses, confs, use_iou_only=False):
         unmatched_dets, unmatched_tracks = set(det_ids), set(act_idx)
         if not act_idx or not det_ids: return unmatched_dets, unmatched_tracks
-
         track_boxes = np.stack([self.tracks[i].box for i in act_idx])
         cost_iou = 1.0 - utils.iou_matrix(track_boxes, boxes[det_ids])
-        
         if use_iou_only:
-            cost_matrix = cost_iou
-            cost_matrix[cost_iou > (1.0 - self.iou_thresh_low)] = 1e6
+            cost_matrix = cost_iou; cost_matrix[cost_iou > (1.0 - self.iou_thresh_low)] = 1e6
         else:
             track_embs = np.stack([self.tracks[i].emb for i in act_idx])
             cost_app = utils.cosine_cost_matrix(track_embs, embs[det_ids])
             cost_matrix = self.iou_w * cost_iou + self.app_w * cost_app
             cost_matrix[cost_iou > (1.0 - self.iou_thresh)] = 1e6
-        
         cost_matrix = self._add_soft_class_penalty(cost_matrix, act_idx, det_ids, clses)
         self._associate(cost_matrix, unmatched_dets, unmatched_tracks, act_idx, det_ids, boxes, embs, clses, confs)
         return unmatched_dets, unmatched_tracks
