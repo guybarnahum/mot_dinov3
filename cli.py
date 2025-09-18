@@ -99,6 +99,9 @@ class TrackerParams:
     conf_min_update: float = 0.3
     conf_update_weight: float = 0.5
     low_conf_iou_only: bool = True
+    # --- ENHANCED: Motion gating and extrapolation parameters ---
+    motion_gate: bool = True
+    extrapolation_window: int = 30 # Frames to use velocity extrapolation
     center_gate_base: float = 50.0
     center_gate_slope: float = 10.0
     class_vote_smoothing: float = 0.6
@@ -219,14 +222,9 @@ def parse_and_merge_config() -> Config:
         section_dc = config_field.type
         section_config = config_data.get(section_name, {})
         for field_info in fields(section_dc):
-            # CLI arguments take highest priority
             value = cli_args_dict.get(field_info.name)
-            
-            # If not in CLI, take from TOML file
             if value is None:
                 value = section_config.get(field_info.name)
-            
-            # If a value was found from either source, set it
             if value is not None:
                 setattr(getattr(final_config, section_name), field_info.name, value)
 
@@ -266,50 +264,37 @@ def run_processing_loop(cfg: Config, cap: cv2.VideoCapture, writer: cv2.VideoWri
     keep_ids = set(int(x) for x in cfg.detector.classes.split(",") if x.strip().isdigit()) if cfg.detector.classes else None
     
     fps_tracker = deque(maxlen=30)
-    
-    # FIX: Track scheduler stats per-frame for the HUD
     prev_reuse_count, prev_real_count = 0, 0
     
     desc = f"Tracking [{device}] frames {cfg.io.start_frame} to {cfg.io.end_frame or 'end'}"
     with tqdm(total=frames_to_process, unit="frame", dynamic_ncols=True, desc=desc) as pbar:
         while frame_idx < end_frame:
             f0 = perf_counter()
-            t = perf_counter()
-            ok, frame = cap.read()
-            stats.stage_timers["read"] += perf_counter() - t
+            t = perf_counter(); ok, frame = cap.read(); stats.stage_timers["read"] += perf_counter() - t
             if not ok: break
 
             viz_info = {} if cfg.viz.viz_reasons else None
 
-            t = perf_counter()
-            boxes, confs, clses = components["detector"].detect(frame, conf_thres=cfg.detector.conf)
-            stats.stage_timers["detect"] += perf_counter() - t
-
+            t = perf_counter(); boxes, confs, clses = components["detector"].detect(frame, conf_thres=cfg.detector.conf); stats.stage_timers["detect"] += perf_counter() - t
             if keep_ids and len(boxes) > 0:
                 mask = np.array([c in keep_ids for c in clses], dtype=bool)
                 boxes, confs, clses = boxes[mask], confs[mask], clses[mask]
             
-            # NOTE: We no longer reset scheduler stats here. It now accumulates totals.
             embs, t_emb, _ = components["scheduler"].run(
                 frame=frame, boxes=boxes, embedder=components["embedder"], tracker=components["tracker"],
                 frame_idx=frame_idx, budget_ms=cfg.scheduler.embed_budget_ms, viz_info=viz_info
             )
             stats.stage_timers["embed"] += t_emb
 
-            t = perf_counter()
-            tracks, reid_events = components["tracker"].update(boxes, embs, confs=confs, clses=clses)
-            stats.stage_timers["track"] += perf_counter() - t
+            t = perf_counter(); tracks, reid_events = components["tracker"].update(boxes, embs, confs=confs, clses=clses); stats.stage_timers["track"] += perf_counter() - t
 
             t = perf_counter()
-            # 1. Draw the base tracks, passing viz_info instead of mark_tids
             draw_tracks(frame, tracks, draw_lost=cfg.viz.draw_lost, thickness=cfg.viz.line_thickness,
                         font_scale=cfg.viz.font_scale, viz_info=viz_info)
             
-            # 2. (Optional) Draw Re-ID links on top
             if cfg.viz.viz_reid and reid_events:
                 draw_reid_links(frame, reid_events)
 
-            # 3. (Optional) Draw the HUD on top of everything
             if cfg.viz.viz_hud:
                 active_count = sum(1 for tr in tracks if getattr(tr, 'state', None) == 'active')
                 lost_count = len(tracks) - active_count
@@ -330,14 +315,11 @@ def run_processing_loop(cfg: Config, cap: cv2.VideoCapture, writer: cv2.VideoWri
                 draw_hud(frame, hud_stats)
             stats.stage_timers["draw"] += perf_counter() - t
 
-            t = perf_counter()
-            writer.write(frame)
-            stats.stage_timers["write"] += perf_counter() - t
+            t = perf_counter(); writer.write(frame); stats.stage_timers["write"] += perf_counter() - t
 
             stats.frame_times.append(perf_counter() - f0)
             fps_tracker.append(perf_counter() - f0)
             
-            # FIX: Update previous stat counts for the next frame's HUD
             prev_reuse_count = components["scheduler"].stat_reuse
             prev_real_count = components["scheduler"].stat_real
 
@@ -364,9 +346,6 @@ def print_summary(cfg: Config, stats: Stats, meta: dict, wall_time: float, devic
     print("  Stage Breakdown (mean per frame | % of total):")
     for name, seconds in stats.stage_timers.items(): print(f"    - {name:<7}: {fmt_ms(seconds):<10} | {pct(seconds):5.1f}%")
     print("-" * 58)
-    
-    # FIX: Remove direct access to 'components'. The 'sched' object passed in
-    # now holds the correct, accumulated totals for the entire run.
     print(sched.summary(frames))
     print("=" * 58)
 
@@ -376,9 +355,7 @@ def main():
     if cfg.io.source is None: raise ValueError("Input video --source is required.")
     hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
     if hf_token: login(token=hf_token, add_to_git_credential=False); print("💡 Hugging Face token found and used for programmatic login.")
-    video_meta, interrupted = {}, False
-    components = {} 
-    
+    video_meta, interrupted, components = {}, False, {}
     try:
         cap, writer = setup_video_io(cfg.io, video_meta)
         end_frame = cfg.io.end_frame if cfg.io.end_frame is not None else video_meta["total_frames"]
@@ -395,7 +372,7 @@ def main():
         if 'writer' in locals(): writer.release()
         cv2.destroyAllWindows()
     if interrupted: print("\n^C received — stopping gracefully. Partial output saved.")
-    if 'stats' in locals() and stats.frame_times:
+    if 'stats' in locals() and 'wall_time' in locals() and stats.frame_times:
         print_summary(cfg, stats, video_meta, wall_time, device, components["scheduler"])
 
 if __name__ == "__main__":
@@ -405,4 +382,3 @@ if __name__ == "__main__":
     except Exception as e:
         if "--debug" in sys.argv or os.getenv("MOT_DEBUG") == "1": raise
         print(f"An unexpected error occurred: {e}", file=sys.stderr); sys.exit(1)
-
