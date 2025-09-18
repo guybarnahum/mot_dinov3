@@ -40,7 +40,7 @@ conf_min_update = 0.4
 conf_high = 0.6
 conf_low = 0.15
 
-# --- NEW: Advanced Re-ID Heuristics ---
+# --- Re-ID Heuristics ---
 # Master switch for motion-based filtering. To disable all motion filtering for
 # a global, appearance-only Re-ID search, use the '--no-motion-gate' flag
 # or set this to false.
@@ -53,10 +53,10 @@ extrapolation_window = 180
 
 # After 'extrapolation_window' frames, the tracker assumes the motion prediction
 # is unreliable and switches to a global, appearance-only search for that track.
-# --- End of New Heuristics ---
+# --- End of Re-ID Heuristics ---
 
 [viz]
-# --- NEW VISUALIZATION MODES ---
+# --- VISUALIZATION MODES ---
 # Enable the scheduler reason codes on bounding boxes (e.g., [C-new], [R-due])
 viz_reasons = true
 
