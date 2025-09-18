@@ -1,4 +1,4 @@
-# src/mot_dinov3/tracker.py (Enhanced with Re-ID Events)
+# src/mot_dinov3/tracker.py (Enhanced with Re-ID Events and Motion Heuristics)
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -6,10 +6,8 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
-# Import shared helpers from the new utils module
 from . import utils
 
-# Optional Hungarian; we fall back to greedy if SciPy isn't present.
 try:
     from scipy.optimize import linear_sum_assignment
     HAS_HUNGARIAN = True
@@ -19,23 +17,37 @@ except ImportError:
 @dataclass
 class Track:
     tid: int
-    box: np.ndarray                 # (4,) xyxy
-    emb: np.ndarray                 # (D,) L2-normalized
-    cls: Optional[int] = None       # stable/majority class (for display)
+    box: np.ndarray
+    emb: np.ndarray
+    cls: Optional[int] = None
     hits: int = 1
     age: int = 1
     time_since_update: int = 0
-    state: str = "active"           # "active" | "lost" | "removed"
-    alpha: float = 0.9              # EMA factor base for embeddings
-    gallery: List[np.ndarray] = field(default_factory=list)
+    state: str = "active"
+    alpha: float = 0.9
+    gallery: List[np.ndarray] = field(default_factory=list, repr=False)
     gallery_max: int = 10
-    cls_hist: Dict[int, float] = field(default_factory=dict)
+    cls_hist: Dict[int, float] = field(default_factory=dict, repr=False)
     last_conf: float = 0.0
+    # --- ENHANCED: Add center and velocity for motion extrapolation ---
+    center: np.ndarray = field(init=False)
+    velocity: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0]), repr=False)
+
+    def __post_init__(self):
+        self.center = utils.centers_xyxy(self.box[np.newaxis, :])[0]
 
     def update(self, box: np.ndarray, emb: np.ndarray,
                det_conf: float = 1.0, det_cls: Optional[int] = None,
                conf_min_update: float = 0.3, conf_update_weight: float = 0.5,
                class_vote_smoothing: float = 0.6, class_decay_factor: float = 0.05):
+        
+        # --- ENHANCED: Update center and velocity with EMA smoothing ---
+        old_center = self.center
+        self.center = utils.centers_xyxy(box[np.newaxis, :])[0]
+        velocity = self.center - old_center
+        self.velocity = 0.7 * self.velocity + 0.3 * velocity # EMA smoothing
+        # --- END ENHANCEMENT ---
+
         self.box = box.astype(np.float32)
 
         det_conf = float(np.clip(det_conf, 0.0, 1.0))
@@ -57,26 +69,20 @@ class Track:
         self.last_conf = det_conf
 
     def _update_class_hist(self, det_cls: int, det_conf: float, smoothing: float, decay: float):
-        """Helper to manage the class histogram update logic."""
         w = det_conf * smoothing
         self.cls_hist[det_cls] = self.cls_hist.get(det_cls, 0.0) * (1.0 - w) + w
-        
         for k in list(self.cls_hist.keys()):
             if k != det_cls:
                 self.cls_hist[k] *= (1.0 - decay * w)
                 if self.cls_hist[k] < 1e-4: del self.cls_hist[k]
-        
-        if self.cls_hist:
-            self.cls = max(self.cls_hist.items(), key=lambda kv: kv[1])[0]
+        if self.cls_hist: self.cls = max(self.cls_hist.items(), key=lambda kv: kv[1])[0]
 
     def mark_lost(self):
         self.time_since_update += 1
         self.age += 1
-        if self.state == "active":
-            self.state = "lost"
+        if self.state == "active": self.state = "lost"
 
     def best_sim(self, emb: np.ndarray) -> float:
-        """Max dot product vs current EMA embedding and recent gallery items."""
         best = float(self.emb @ emb)
         for g_emb in self.gallery[-5:]:
             sim = float(g_emb @ emb)
@@ -86,7 +92,6 @@ class Track:
 
 class SimpleTracker:
     def __init__(self, **kwargs):
-        # Use kwargs to set all parameters from the dataclasses in cli.py
         self.iou_w = kwargs.get('iou_weight', 0.3)
         self.app_w = kwargs.get('app_weight', 0.7)
         self.iou_thresh = kwargs.get('iou_thresh', 0.3)
@@ -108,12 +113,13 @@ class SimpleTracker:
         self.center_gate_slope = kwargs.get('center_gate_slope', 10.0)
         self.class_vote_smoothing = kwargs.get('class_vote_smoothing', 0.6)
         self.class_decay_factor = kwargs.get('class_decay_factor', 0.05)
+        # --- ENHANCED: Added new parameters for motion heuristics ---
+        self.motion_gate = kwargs.get('motion_gate', True)
+        self.extrapolation_window = kwargs.get('extrapolation_window', 30)
         
         self.tracks: List[Track] = []
         self._next_id = 1
-        # --- ENHANCEMENT: Add a list to store Re-ID events for the current frame ---
         self.reid_events_this_frame: List[Dict] = []
-
 
     def _new_track(self, box: np.ndarray, emb: np.ndarray, cls: Optional[int]) -> Track:
         t = Track(tid=self._next_id, box=box, emb=emb, cls=cls if (cls is not None and cls >= 0) else None,
@@ -128,74 +134,57 @@ class SimpleTracker:
                        not (t.state == "lost" and t.time_since_update > self.reid_max)]
 
     def _add_soft_class_penalty(self, C: np.ndarray, act_idx: List[int], det_ids: List[int], clses: Optional[np.ndarray]) -> np.ndarray:
-        if clses is None or not self.class_consistent or self.class_penalty <= 0.0 or not act_idx or not det_ids:
-            return C
+        if clses is None or not self.class_consistent or self.class_penalty <= 0.0 or not act_idx or not det_ids: return C
         track_classes = np.array([self.tracks[ti].cls for ti in act_idx], dtype=object)
         det_classes = clses[det_ids]
-
         is_valid_track = (track_classes != None)[:, None]
         is_mismatched = track_classes[:, None] != det_classes[None, :]
         penalty_mask = np.logical_and(is_valid_track, is_mismatched)
-
         return C + self.class_penalty * penalty_mask.astype(np.float32)
 
     def _associate(self, cost_matrix: np.ndarray, unmatched_dets: Set[int], unmatched_tracks: Set[int],
                    act_idx: List[int], det_ids: List[int], boxes: np.ndarray, embs: np.ndarray,
-                   clses: Optional[np.ndarray], confs: Optional[np.ndarray]):
-        if self.use_hungarian:
-            rows, cols = linear_sum_assignment(cost_matrix)
-        else: # Greedy assignment
-            rows, cols = [], []
-            used_r, used_c = set(), set()
-            indices = np.argsort(cost_matrix.flatten())
-            for idx in indices:
+                   clses: Optional[np.ndarray], confs: Optional[np.ndarray], is_reid: bool = False):
+        if self.use_hungarian: rows, cols = linear_sum_assignment(cost_matrix)
+        else:
+            rows, cols, used_r, used_c = [], [], set(), set()
+            for idx in np.argsort(cost_matrix.flatten()):
                 r, c = np.unravel_index(idx, cost_matrix.shape)
                 if r not in used_r and c not in used_c:
-                    rows.append(r); cols.append(c)
-                    used_r.add(r); used_c.add(c)
+                    rows.append(r); cols.append(c); used_r.add(r); used_c.add(c)
         
         for r, c in zip(rows, cols):
-            # Apply a cost threshold to prevent matching dissimilar pairs
             if cost_matrix[r, c] > 0.99: continue
-            
             ti, j = act_idx[r], det_ids[c]
-            self.tracks[ti].update(
-                boxes[j], embs[j],
-                det_conf=(confs[j] if confs is not None else 1.0),
-                det_cls=(int(clses[j]) if clses is not None else None),
-                conf_min_update=self.conf_min_update, conf_update_weight=self.conf_update_weight,
-                class_vote_smoothing=self.class_vote_smoothing, class_decay_factor=self.class_decay_factor
-            )
+            track = self.tracks[ti]
+
+            if is_reid:
+                event = {"tid": track.tid, "old_box": track.box.copy(), "new_box": boxes[j], "score": track.best_sim(embs[j])}
+                self.reid_events_this_frame.append(event)
+            
+            track.update(boxes[j], embs[j], det_conf=(confs[j] if confs is not None else 1.0), det_cls=(int(clses[j]) if clses is not None else None),
+                         conf_min_update=self.conf_min_update, conf_update_weight=self.conf_update_weight,
+                         class_vote_smoothing=self.class_vote_smoothing, class_decay_factor=self.class_decay_factor)
             unmatched_dets.discard(j)
             unmatched_tracks.discard(ti)
 
     def update(self, det_boxes: np.ndarray, det_embs: np.ndarray,
                confs: Optional[np.ndarray] = None, clses: Optional[np.ndarray] = None) -> Tuple[List[Track], List[Dict]]:
-        
-        # --- ENHANCEMENT: Clear the Re-ID event list at the start of each frame ---
         self.reid_events_this_frame.clear()
-
         N = len(det_boxes)
         # --- Stage 1: Associate ACTIVE tracks ---
         if confs is not None:
-            hi_ids = [i for i, c in enumerate(confs) if c >= self.conf_high]
-            lo_ids = [i for i, c in enumerate(confs) if self.conf_low <= c < self.conf_high]
-        else:
-            hi_ids, lo_ids = list(range(N)), []
-
+            hi_ids, lo_ids = [i for i, c in enumerate(confs) if c >= self.conf_high], [i for i, c in enumerate(confs) if self.conf_low <= c < self.conf_high]
+        else: hi_ids, lo_ids = list(range(N)), []
         act_idx = [i for i, t in enumerate(self.tracks) if t.state == "active"]
         unmatched_tracks = set(act_idx)
-        
         unmatched_hi, unmatched_tracks = self._match_active(list(unmatched_tracks), hi_ids, det_boxes, det_embs, clses, confs, use_iou_only=False)
         unmatched_lo, unmatched_tracks = self._match_active(list(unmatched_tracks), lo_ids, det_boxes, det_embs, clses, confs, use_iou_only=self.low_conf_iou_only)
-        
         for ti in unmatched_tracks: self.tracks[ti].mark_lost()
         
         # --- Stage 2: Re-ID LOST tracks ---
         unmatched_dets = unmatched_hi.union(unmatched_lo)
-        
-        # Pass the list to be populated by the function
-        self._reid_lost(unmatched_dets, det_boxes, det_embs, clses, confs, self.reid_events_this_frame)
+        self._reid_lost(unmatched_dets, det_boxes, det_embs, clses, confs)
 
         # --- Stage 3: Create new tracks ---
         for j in sorted(list(unmatched_dets)):
@@ -229,62 +218,47 @@ class SimpleTracker:
         return unmatched_dets, unmatched_tracks
 
     def _reid_lost(self, unmatched_dets: Set[int], boxes: np.ndarray, embs: np.ndarray,
-                   clses: Optional[np.ndarray], confs: Optional[np.ndarray], reid_events: List[Dict]):
+                   clses: Optional[np.ndarray], confs: Optional[np.ndarray]):
+        # --- ENHANCED: Split lost tracks into two groups for staged search ---
         lost_idx = [i for i, t in enumerate(self.tracks) if t.state == "lost"]
-        det_left = sorted(list(unmatched_dets))
-        if not lost_idx or not det_left: return
-
-        lost_embs = np.stack([self.tracks[i].emb for i in lost_idx])
-        cost_matrix = utils.cosine_cost_matrix(lost_embs, embs[det_left])
         
-        # Gating based on appearance similarity
-        cost_matrix[cost_matrix > (1.0 - self.reid_sim_thresh)] = 1e6
+        # Correctly get the track objects for filtering
+        lost_tracks_all = [self.tracks[i] for i in lost_idx]
         
-        # Gating based on motion (center distance)
-        lost_centers = utils.centers_xyxy(np.stack([self.tracks[i].box for i in lost_idx]))
-        det_centers = utils.centers_xyxy(boxes[det_left])
-        dist = np.linalg.norm(lost_centers[:, None, :] - det_centers[None, :, :], axis=2)
-        allowance = np.array([self.center_gate_base + self.center_gate_slope * t.time_since_update for t in [self.tracks[i] for i in lost_idx]])
-        cost_matrix[dist > allowance[:, None]] = 1e6
+        lost_gated_idx = [i for i, t in zip(lost_idx, lost_tracks_all) if t.time_since_update <= self.extrapolation_window]
+        lost_global_idx = [i for i, t in zip(lost_idx, lost_tracks_all) if t.time_since_update > self.extrapolation_window]
         
-        if self.use_hungarian:
-            rows, cols = linear_sum_assignment(cost_matrix)
-        else: # Greedy assignment
-            rows, cols = [], []
-            used_r, used_c = set(), set()
-            indices = np.argsort(cost_matrix.flatten())
-            for idx in indices:
-                r, c = np.unravel_index(idx, cost_matrix.shape)
-                if r not in used_r and c not in used_c:
-                    rows.append(r); cols.append(c)
-                    used_r.add(r); used_c.add(c)
+        # --- Phase 2a: Gated Re-ID for recently lost tracks ---
+        det_left_ids = sorted(list(unmatched_dets))
+        if lost_gated_idx and det_left_ids:
+            lost_tracks = [self.tracks[i] for i in lost_gated_idx]
+            det_boxes = boxes[det_left_ids]
+            det_embs = embs[det_left_ids]
+            cost_app = utils.cosine_cost_matrix(np.stack([t.emb for t in lost_tracks]), det_embs)
+            cost_matrix = cost_app.copy()
+            cost_matrix[cost_app > (1.0 - self.reid_sim_thresh)] = 1e6
 
-        # --- ENHANCEMENT: This loop now creates Re-ID events ---
-        for r, c in zip(rows, cols):
-            if cost_matrix[r, c] >= 1e6: continue
+            if self.motion_gate:
+                time_since = np.array([t.time_since_update for t in lost_tracks])
+                pred_centers = np.stack([t.center for t in lost_tracks]) + np.stack([t.velocity for t in lost_tracks]) * time_since[:, np.newaxis]
+                det_centers = utils.centers_xyxy(det_boxes)
+                dist = np.linalg.norm(pred_centers[:, np.newaxis, :] - det_centers[np.newaxis, :, :], axis=2)
+                allowance = self.center_gate_base + self.center_gate_slope * time_since
+                cost_matrix[dist > allowance[:, np.newaxis]] = 1e6
 
-            ti = lost_idx[r]
-            j = det_left[c]
-            track = self.tracks[ti]
+            unmatched_lost_gated = set(range(len(lost_gated_idx)))
+            self._associate(cost_matrix, unmatched_dets, unmatched_lost_gated, lost_gated_idx, det_left_ids, boxes, embs, clses, confs, is_reid=True)
+        
+        # --- Phase 2b: Global Re-ID for long-lost tracks ---
+        det_left_ids = sorted(list(unmatched_dets))
+        if lost_global_idx and det_left_ids:
+            lost_tracks = [self.tracks[i] for i in lost_global_idx]
+            det_boxes = boxes[det_left_ids]
+            det_embs = embs[det_left_ids]
+            cost_app = utils.cosine_cost_matrix(np.stack([t.emb for t in lost_tracks]), det_embs)
+            cost_matrix = cost_app.copy()
+            cost_matrix[cost_app > (1.0 - self.reid_sim_thresh)] = 1e6
             
-            # Create the event dictionary BEFORE the track is updated for accurate visualization
-            event = {
-                "tid": track.tid,
-                "old_box": track.box.copy(),
-                "new_box": boxes[j],
-                "score": track.best_sim(embs[j]) # Use best_sim for consistency with gallery
-            }
-            reid_events.append(event)
-            
-            # Update the track with the new detection info, reactivating it
-            track.update(
-                boxes[j], embs[j],
-                det_conf=(confs[j] if confs is not None else 1.0),
-                det_cls=(int(clses[j]) if clses is not None else None),
-                conf_min_update=self.conf_min_update, conf_update_weight=self.conf_update_weight,
-                class_vote_smoothing=self.class_vote_smoothing, class_decay_factor=self.class_decay_factor
-            )
-            
-            # Remove the detection from the unmatched set so it's not used to create a new track
-            unmatched_dets.remove(j)
+            unmatched_lost_global = set(range(len(lost_global_idx)))
+            self._associate(cost_matrix, unmatched_dets, unmatched_lost_global, lost_global_idx, det_left_ids, boxes, embs, clses, confs, is_reid=True)
 

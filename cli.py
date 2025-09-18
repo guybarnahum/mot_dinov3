@@ -382,3 +382,4 @@ if __name__ == "__main__":
     except Exception as e:
         if "--debug" in sys.argv or os.getenv("MOT_DEBUG") == "1": raise
         print(f"An unexpected error occurred: {e}", file=sys.stderr); sys.exit(1)
+
