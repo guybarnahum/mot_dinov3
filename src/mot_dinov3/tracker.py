@@ -217,7 +217,6 @@ class SimpleTracker:
                    clses: Optional[np.ndarray], confs: Optional[np.ndarray]):
         # --- ENHANCED: Split lost tracks into two groups for staged search ---
         lost_idx = [i for i, t in enumerate(self.tracks) if t.state == "lost"]
-        
         lost_tracks_all = [self.tracks[i] for i in lost_idx]
         lost_gated_idx = [i for i, t in zip(lost_idx, lost_tracks_all) if t.time_since_update <= self.extrapolation_window]
         lost_global_idx = [i for i, t in zip(lost_idx, lost_tracks_all) if t.time_since_update > self.extrapolation_window]
