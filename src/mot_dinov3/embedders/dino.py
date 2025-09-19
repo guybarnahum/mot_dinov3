@@ -82,7 +82,7 @@ class DinoV3Embedder:
         self.processor = None
         try:
             # Prefer fast processor (DINOv3 often only ships a *fast* class)
-            self.processor = _load_with_token(
+            self.processor = load_with_token(
                 AutoImageProcessor.from_pretrained,
                 model_name,
                 use_fast=True,
