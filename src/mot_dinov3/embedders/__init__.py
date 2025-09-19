@@ -1,8 +1,11 @@
+# src/mot_dinov3/embedders/__init__.py
 from .dino import DinoV3Embedder
 try:
     from .transreid import TransReIDEmbedder
 except Exception:
-    TransReIDEmbedder = None  # optional
+    TransReIDEmbedder = None
+
+from .base import GatedModelAccessError
 
 _REG = {
     "dino": DinoV3Embedder, "dinov3": DinoV3Embedder, "dinov2": DinoV3Embedder,

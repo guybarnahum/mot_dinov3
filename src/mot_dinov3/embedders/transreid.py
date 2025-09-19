@@ -10,7 +10,7 @@ except Exception:
 # then use Resample.BICUBIC
 
 from transformers import AutoModel, AutoImageProcessor
-from .base import BaseEmbedder, pick_amp_dtype
+from .base import BaseEmbedder, pick_amp_dtype, GatedModelAccessError, load_with_token
 
 class TransReIDEmbedder:  # implements BaseEmbedder
     def __init__(self, model_name: str="your-hf-user/transreid-vit-s",
@@ -21,7 +21,28 @@ class TransReIDEmbedder:  # implements BaseEmbedder
         self.use_autocast = use_autocast and (self.device == "cuda") and torch.cuda.is_available()
         self.image_size = image_size  # (H,W)
 
-        self.model = AutoModel.from_pretrained(model_name, trust_remote_code=True).to(self.device).eval()
+                # --- Load model first (we can still run manual preprocessing) ---
+        try:
+            self.model = load_with_token(
+                AutoModel.from_pretrained, model_name, trust_remote_code=True
+            ).to(self.device).eval()
+        except Exception as e:
+            msg = str(e).lower()
+            if ("gated repo" in msg) or ("401" in msg and "huggingface" in msg) or ("access to model" in msg):
+                tips = (
+                    f"Model '{model_name}' is gated on Hugging Face.\n"
+                    "To use it:\n"
+                    "  1) Visit the model page while logged in and click “Agree/Request access”.\n"
+                    "  2) Provide an access token (recommended via .env):\n"
+                    "       HF_TOKEN=hf_xxx  # then `source .venv/bin/activate` and run again\n"
+                    "     Or log in once: `huggingface-cli login`.\n"
+                    "  3) Or choose an open fallback, e.g.: --dinov3 facebook/dinov2-base"
+                )
+                if os.getenv("HF_HUB_DISABLE_IMPLICIT_TOKEN") in {"1", "ON", "YES", "TRUE"}:
+                    tips += "\nNote: HF_HUB_DISABLE_IMPLICIT_TOKEN=1 is set; unset it or pass the token explicitly."
+                raise GatedModelAccessError(tips) from e
+            raise
+
         try:
             self.processor = AutoImageProcessor.from_pretrained(model_name, use_fast=True, trust_remote_code=True)
         except Exception as e:

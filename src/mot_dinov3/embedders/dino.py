@@ -19,11 +19,7 @@ from .. import compat as _compat
 _compat.apply(strict_numpy=False, quiet=True)
 
 from transformers import AutoImageProcessor, AutoModel
-
-
-class GatedModelAccessError(RuntimeError):
-    """Raised when a gated HF repo is requested without granted access / auth."""
-
+from .base import GatedModelAccessError, load_with_token 
 
 def _to_list(x):
     return x if isinstance(x, (list, tuple)) else [x]
@@ -60,16 +56,9 @@ class DinoV3Embedder:
             or os.getenv("HUGGING_FACE_HUB_TOKEN")
         )
 
-        def _load_with_token(factory, repo_id, **extra):
-            # Newer transformers uses token=, older uses use_auth_token=
-            try:
-                return factory(repo_id, token=tok, **extra) if tok else factory(repo_id, **extra)
-            except TypeError:
-                return factory(repo_id, use_auth_token=tok, **extra) if tok else factory(repo_id, **extra)
-
         # --- Load model first (we can still run manual preprocessing) ---
         try:
-            self.model = _load_with_token(
+            self.model = load_with_token(
                 AutoModel.from_pretrained, model_name, trust_remote_code=True
             ).to(self.device).eval()
         except Exception as e:
