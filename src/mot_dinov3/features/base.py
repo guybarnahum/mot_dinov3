@@ -10,6 +10,10 @@ class GenericExtractor:
     """
     def __init__(self, embedder, name: str, device: str,
                  pad: float, square: bool, autocast: bool, amp_dtype: Optional[object] = None):
+
+        assert hasattr(embedder, "_prep_inputs") and hasattr(embedder, "_extract_feat"), \
+                f"Embedder {type(embedder).__name__} must implement _prep_inputs and _extract_feat"
+
         self._e = embedder
         self.name = name
         self.dim = int(getattr(embedder, "emb_dim", 768))

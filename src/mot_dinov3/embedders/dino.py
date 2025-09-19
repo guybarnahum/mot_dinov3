@@ -183,6 +183,39 @@ class DinoV3Embedder:
         x = torch.from_numpy(np.stack(arrs, axis=0)).to(self.device, non_blocking=True)  # [B,3,H,W]
         return {"pixel_values": x}
 
+    def _extract_feat(self, out) -> torch.Tensor:
+        """
+        Return a 2D tensor [N, D] with global features.
+        Prefer pooler_output; otherwise average patch tokens or use CLS if only one token.
+        Handles common HF return types (dict-like or object with attributes).
+        """
+        # dict-like (rare, but be robust)
+        if isinstance(out, dict):
+            if "pooler_output" in out and out["pooler_output"] is not None:
+                return out["pooler_output"]
+            toks = out.get("last_hidden_state", None)
+            if toks is None:
+                # some models return a tuple as first element
+                first = out.get(0, None)
+                if first is not None:
+                    toks = first
+            if toks is None:
+                raise RuntimeError("DINO forward() returned no recognizable feature.")
+            return toks[:, 1:, :].mean(dim=1) if toks.shape[1] > 1 else toks[:, 0, :]
+
+        # attribute-style (typical HF BaseModelOutputWithPooling)
+        if getattr(out, "pooler_output", None) is not None:
+            return out.pooler_output
+
+        toks = getattr(out, "last_hidden_state", None)
+        if toks is None:
+            # handle tuple-style returns
+            if isinstance(out, (tuple, list)) and len(out) > 0:
+                toks = out[0]
+            else:
+                raise RuntimeError("DINO forward() returned no recognizable feature.")
+        return toks[:, 1:, :].mean(dim=1) if toks.shape[1] > 1 else toks[:, 0, :]
+
     def _maybe_autocast(self):
         if self.use_autocast:
             return torch.autocast(device_type="cuda", dtype=self._amp_dtype)
