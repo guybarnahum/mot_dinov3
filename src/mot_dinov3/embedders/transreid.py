@@ -18,7 +18,7 @@ from .base import BaseEmbedder, pick_amp_dtype, GatedModelAccessError, load_with
 class TransReIDEmbedder:  # implements BaseEmbedder
     def __init__(self, model_name: str="your-hf-user/transreid-vit-s",
                  device: Optional[str]=None, use_autocast: bool=True,
-                 image_size: Tuple[int,int]=(256,128), verbose: bool=True):
+                 image_size: Tuple[int,int]=(384,128), verbose: bool=True):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.model_name, self.verbose = model_name, verbose
         self.use_autocast = use_autocast and (self.device == "cuda") and torch.cuda.is_available()
