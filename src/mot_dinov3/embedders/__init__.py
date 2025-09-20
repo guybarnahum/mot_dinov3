@@ -5,16 +5,17 @@ try:
 except Exception:
     TransReIDEmbedder = None
 
-try:
+#try:
     from .osnet import OSNetEmbedder           
-except Exception:
-    OSNetEmbedder = None
+#except Exception:
+#    OSNetEmbedder = None
 
 from .base import GatedModelAccessError, parse_hf_spec 
 
 _REG = {
     "dino": DinoV3Embedder, "dinov3": DinoV3Embedder, "dinov2": DinoV3Embedder,
     "transreid": TransReIDEmbedder, "reid": TransReIDEmbedder, "trans-reid": TransReIDEmbedder,
+    "osnet": OSNetEmbedder,
 }
 
 def create_embedder(kind: str, **kwargs):
