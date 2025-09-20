@@ -1,6 +1,8 @@
+# src/mot_dinov3/embedders/osnet.py
 from __future__ import annotations
-import os
+import os, re, importlib
 from typing import List, Dict, Optional, Tuple
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -13,9 +15,17 @@ except Exception:
     Resample = Image                     # Pillow < 10
 
 from huggingface_hub import HfApi, hf_hub_download
-import torchreid
 
-from .base import pick_amp_dtype, get_hf_token, parse_hf_spec  # <-- added parse_hf_spec
+from .base import pick_amp_dtype, get_hf_token, parse_hf_spec
+
+
+def _import_torchreid_modules():
+    """
+    Import only the submodules we need so we don't pull in optional dataset deps (e.g. gdown).
+    """
+    m_models = importlib.import_module("torchreid.reid.models")
+    m_utils  = importlib.import_module("torchreid.reid.utils")
+    return m_models, m_utils
 
 
 class OSNetEmbedder:
@@ -61,7 +71,6 @@ class OSNetEmbedder:
         # If --embed-model looks like an HF spec, parse it and fill hf_repo/file/revision.
         repo_auto, file_auto, rev_auto = parse_hf_spec(self.model_name)
         if repo_auto:
-            # Treat model_name as an HF spec; let hf_* override only if not provided explicitly.
             hf_repo = hf_repo or repo_auto
             hf_file = hf_file or file_auto
             revision = revision or rev_auto
@@ -80,8 +89,11 @@ class OSNetEmbedder:
         self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
         self.std  = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
 
+        # Import only what we need from torchreid to avoid optional deps
+        treid_models, treid_utils = _import_torchreid_modules()
+
         # 1) Build backbone (ImageNet init True; we’ll load ReID weights next)
-        self.model = torchreid.models.build_model(
+        self.model = treid_models.build_model(
             name=self.model_name, num_classes=1000, loss="softmax", pretrained=True
         )
         if hasattr(self.model, "classifier"):
@@ -100,7 +112,7 @@ class OSNetEmbedder:
         elif weights and weights.startswith(("http://", "https://")):
             # Let torchreid handle URLs (Google Drive, etc.)
             try:
-                fpath = torchreid.utils.download_url(weights, root="~/.cache/torchreid")
+                fpath = treid_utils.download_url(weights, root="~/.cache/torchreid")
                 weight_path = fpath
             except Exception as e:
                 if verbose:
@@ -110,7 +122,7 @@ class OSNetEmbedder:
             # If hf_file not given, try to auto-pick a .pt/.pth that mentions 'osnet'
             if hf_file is None:
                 try:
-                    files = HfApi().list_repo_files(hf_repo, revision=revision)
+                    files = HfApi().list_repo_files(repo_id=hf_repo, revision=revision)
                     cands = [f for f in files if f.lower().endswith((".pt", ".pth")) and "osnet" in f.lower()]
                     # Prefer ReID dataset–trained weights if present
                     priority = ["msmt", "market", "duke", "imagenet"]
@@ -134,7 +146,7 @@ class OSNetEmbedder:
         # 3) Load weights if found (okay if None -> ImageNet init)
         if weight_path:
             try:
-                torchreid.utils.load_pretrained_weights(self.model, weight_path)
+                treid_utils.load_pretrained_weights(self.model, weight_path)
                 if verbose:
                     print(f"[osnet] loaded weights: {weight_path}")
             except Exception as e:
@@ -144,9 +156,21 @@ class OSNetEmbedder:
         # 4) Probe embedding dim
         with torch.inference_mode():
             H, W = self.image_size
-            dummy = torch.zeros(1, 3, H, W, device=self.device)
+            dummy = torch.zeros(1, 3, H, W, device=self.device, dtype=torch.float32)
             z = self.model(dummy)
-            self.emb_dim = int(z.shape[-1]) if z.ndim == 2 else int(torch.mean(z, dim=(2, 3)).shape[1])
+            if isinstance(z, torch.Tensor):
+                if z.ndim == 2:
+                    self.emb_dim = int(z.shape[-1])
+                elif z.ndim == 4:
+                    self.emb_dim = int(torch.mean(z, dim=(2, 3)).shape[1])
+                else:
+                    # Fallback: flatten last dim
+                    self.emb_dim = int(z.view(z.size(0), -1).shape[1])
+            elif isinstance(z, (tuple, list)) and z and isinstance(z[0], torch.Tensor):
+                zz = z[0]
+                self.emb_dim = int(zz.shape[-1]) if zz.ndim == 2 else int(torch.mean(zz, dim=(2, 3)).shape[1])
+            else:
+                raise RuntimeError("OSNet: unexpected forward() output during probing")
 
     # ---------- I/O expected by GenericExtractor ----------
 
@@ -163,7 +187,8 @@ class OSNetEmbedder:
             x = x.pin_memory().to(self.device, non_blocking=True)
         else:
             x = x.to(self.device)
-        return {"x": x}  # GenericExtractor calls self.model(**inputs)
+        # GenericExtractor calls self.model(**inputs), and torchreid models expect 'x'
+        return {"x": x}
 
     def _extract_feat(self, out) -> torch.Tensor:
         if isinstance(out, torch.Tensor):
@@ -176,7 +201,5 @@ class OSNetEmbedder:
             return z if z.ndim == 2 else torch.mean(z, dim=(2, 3))
         raise RuntimeError("OSNet: unexpected forward() output")
 
-    # Allow GenericExtractor to call self.model(**inputs)
-    def __call__(self, **kwargs):
-        return self.model(kwargs.get("x"))
-    forward = __call__
+    # Allow GenericExtractor to call self.model(**inputs) directly.
+    # (No need to override __call__; GenericExtractor uses self.model)
