@@ -51,6 +51,9 @@ class OSNetEmbedder:
       revision: optional HF revision/commit to pin
       verbose: print hints
     """
+    # --- replace your current __init__ signature & amp dtype setup with this ---
+
+class OSNetEmbedder:
     def __init__(self,
                  model_name: str = "osnet_x1_0",
                  image_size: Tuple[int, int] = (256, 128),
@@ -60,13 +63,22 @@ class OSNetEmbedder:
                  hf_repo: Optional[str] = None,
                  hf_file: Optional[str] = None,
                  revision: Optional[str] = None,
-                 verbose: bool = True):
+                 verbose: bool = True,
+                 amp_dtype: Optional[object] = None,   # <-- NEW: accept amp_dtype
+                 **kwargs):                              # <-- NEW: swallow any future extras
 
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.model_name, self.verbose = model_name, verbose
         self.image_size = image_size
         self.use_autocast = bool(use_autocast and self.device == "cuda")
-        self._amp_dtype = pick_amp_dtype() if self.use_autocast else torch.float32
+
+        # accept string or torch.dtype; fall back to picker
+        if amp_dtype is None:
+            self._amp_dtype = pick_amp_dtype() if self.use_autocast else torch.float32
+        else:
+            if isinstance(amp_dtype, str):
+                amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(amp_dtype.lower(), torch.float32)
+            self._amp_dtype = amp_dtype
 
         # If --embed-model looks like an HF spec, parse it and fill hf_repo/file/revision.
         repo_auto, file_auto, rev_auto = parse_hf_spec(self.model_name)
