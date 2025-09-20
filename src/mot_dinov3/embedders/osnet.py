@@ -14,10 +14,21 @@ except Exception:
     from PIL import Image
     Resample = Image                     # Pillow < 10
 
+# --- Minimal stub if tensorboard is missing (for torchreid import) ---
+try:
+    from torch.utils import tensorboard as _tb  # requires 'tensorboard' package
+except Exception:
+    import sys, types
+    class _NullWriter:
+        def __init__(self, *a, **k): pass
+        def add_scalar(self, *a, **k): pass
+        def add_histogram(self, *a, **k): pass
+        def add_image(self, *a, **k): pass
+        def close(self): pass
+    sys.modules["torch.utils.tensorboard"] = types.SimpleNamespace(SummaryWriter=_NullWriter)
+
 from huggingface_hub import HfApi, hf_hub_download
-
 from .base import pick_amp_dtype, get_hf_token, parse_hf_spec
-
 
 def _import_torchreid_modules():
     """
