@@ -8,8 +8,9 @@ try:
     from PIL import Image
     Resample = Image.Resampling
 except Exception:
-    Resample = Image  # Pillow < 10
-# then use Resample.BICUBIC
+    # Pillow < 10
+    from PIL import Image
+    Resample = Image  # then use Resample.BICUBIC
 
 from typing import List, Tuple, Optional, Any, Dict
 from contextlib import nullcontext
@@ -19,7 +20,8 @@ from .. import compat as _compat
 _compat.apply(strict_numpy=False, quiet=True)
 
 from transformers import AutoImageProcessor, AutoModel
-from .base import GatedModelAccessError, load_with_token 
+from .base import GatedModelAccessError, load_with_token, parse_hf_spec
+
 
 def _to_list(x):
     return x if isinstance(x, (list, tuple)) else [x]
@@ -29,11 +31,15 @@ class DinoV3Embedder:
     """
     Robust DINO(v3/v2) embedder.
 
+    Supports model names like:
+      - 'facebook/dinov3-vitb16-pretrain-lvd1689m'
+      - 'facebook/dinov3-vitb16-pretrain-lvd1689m@rev'
+      - 'owner/repo#sub/dir' (loads from subfolder)
+      - 'hf:owner/repo[:sub/dir][@rev]'
+
     Load order:
       1) AutoImageProcessor (trust_remote_code=True, prefer fast)
-      2) If unavailable/unrecognized, build a manual preprocessor from model config:
-         - image_size from config (or 224)
-         - mean/std from config (or ImageNet)
+      2) If unavailable/unrecognized, build a manual preprocessor from model config.
     Produces L2-normalized global embeddings from pooled output or patch-token mean.
     """
 
@@ -49,29 +55,38 @@ class DinoV3Embedder:
         self.model_name = model_name
         self.verbose = verbose
 
-        # Grab token from env (supports HF_TOKEN and legacy names via compat bridge)
-        tok = (
-            os.getenv("HF_TOKEN")
-            or os.getenv("HUGGINGFACE_HUB_TOKEN")
-            or os.getenv("HUGGING_FACE_HUB_TOKEN")
-        )
+        # Parse optional HF spec → (repo_id, subfolder, revision, repo_type)
+        repo_id, subfolder, revision, repo_type = parse_hf_spec(model_name)
+        if repo_type and repo_type not in (None, "model", "models"):
+            # Transformers' AutoModel expects the "models" hub, not spaces/datasets
+            raise ValueError(
+                f"DINO expects a model repository, but got repo_type='{repo_type}'. "
+                f"Use a 'models' repo id such as 'facebook/dinov3-vitb16-pretrain-lvd1689m'."
+            )
+        repo_arg = repo_id or model_name
+        subfolder_kwargs = {"subfolder": subfolder} if subfolder else {}
+        revision_kwargs = {"revision": revision} if revision else {}
 
         # --- Load model first (we can still run manual preprocessing) ---
         try:
             self.model = load_with_token(
-                AutoModel.from_pretrained, model_name, trust_remote_code=True
+                AutoModel.from_pretrained,
+                repo_arg,
+                trust_remote_code=True,
+                **subfolder_kwargs,
+                **revision_kwargs,
             ).to(self.device).eval()
         except Exception as e:
             msg = str(e).lower()
             if ("gated repo" in msg) or ("401" in msg and "huggingface" in msg) or ("access to model" in msg):
                 tips = (
-                    f"Model '{model_name}' is gated on Hugging Face.\n"
+                    f"Model '{repo_arg}' is gated on Hugging Face.\n"
                     "To use it:\n"
                     "  1) Visit the model page while logged in and click “Agree/Request access”.\n"
                     "  2) Provide an access token (recommended via .env):\n"
                     "       HF_TOKEN=hf_xxx  # then `source .venv/bin/activate` and run again\n"
                     "     Or log in once: `huggingface-cli login`.\n"
-                    "  3) Or choose an open fallback, e.g.: --dinov3 facebook/dinov2-base"
+                    "  3) Or choose an open fallback, e.g.: --embed-model facebook/dinov2-base"
                 )
                 if os.getenv("HF_HUB_DISABLE_IMPLICIT_TOKEN") in {"1", "ON", "YES", "TRUE"}:
                     tips += "\nNote: HF_HUB_DISABLE_IMPLICIT_TOKEN=1 is set; unset it or pass the token explicitly."
@@ -84,16 +99,20 @@ class DinoV3Embedder:
             # Prefer fast processor (DINOv3 often only ships a *fast* class)
             self.processor = load_with_token(
                 AutoImageProcessor.from_pretrained,
-                model_name,
+                repo_arg,
                 use_fast=True,
                 trust_remote_code=True,
+                **subfolder_kwargs,
+                **revision_kwargs,
             )
             if self.verbose:
-                print(f"[embedder] Using AutoImageProcessor (fast) for {model_name}")
+                pretty = repo_arg + (f"#{subfolder}" if subfolder else "") + (f"@{revision}" if revision else "")
+                print(f"[embedder] Using AutoImageProcessor (fast) for {pretty}")
         except Exception as e:
             # Fall back to manual preprocessing if processor isn't available
             if self.verbose:
-                print(f"[embedder] AutoImageProcessor unavailable for {model_name} → "
+                pretty = repo_arg + (f"#{subfolder}" if subfolder else "") + (f"@{revision}" if revision else "")
+                print(f"[embedder] AutoImageProcessor unavailable for {pretty} → "
                       f"falling back to manual preprocessing ({e})")
             self._build_manual_preproc()
 
@@ -121,7 +140,6 @@ class DinoV3Embedder:
             self._amp_dtype = torch.float32
 
         if (self.processor is None) and self.verbose:
-            # REFACTOR: Use a more readable f-string for output
             mean_str = [f"{x:.3f}" for x in self.mean.flatten()]
             std_str = [f"{x:.3f}" for x in self.std.flatten()]
             print(f"[embedder] Manual preprocess: size={self.image_size}, mean={mean_str}, std={std_str}")
@@ -195,8 +213,7 @@ class DinoV3Embedder:
                 return out["pooler_output"]
             toks = out.get("last_hidden_state", None)
             if toks is None:
-                # some models return a tuple as first element
-                first = out.get(0, None)
+                first = out.get(0, None)  # some models return a tuple as first element
                 if first is not None:
                     toks = first
             if toks is None:

@@ -30,6 +30,7 @@ except Exception:
 from huggingface_hub import HfApi, hf_hub_download
 from .base import pick_amp_dtype, get_hf_token, parse_hf_spec
 
+
 def _import_torchreid_modules():
     """
     Import only the submodules we need so we don't pull in optional dataset deps (e.g. gdown).
@@ -45,12 +46,14 @@ class OSNetEmbedder:
 
     Args:
       model_name: torchreid OSNet arch (e.g. 'osnet_x1_0', 'osnet_ain_x1_0', ...)
-                  OR a Hugging Face spec:
+                  OR a Hugging Face spec (new 4-part parser):
                     'org/repo'
                     'org/repo@rev'
                     'org/repo#sub/dir/file.pth'
                     'org/repo#sub/dir/file.pth@rev'
                     'hf:org/repo[:sub/dir/file.pth][@rev]'
+                    'spaces/owner/name#path@rev'   (repo_type='space')
+                    'datasets/owner/name#path@rev' (repo_type='dataset')
       image_size: (H, W), OSNet typically uses (256, 128)
       device: 'cuda' or 'cpu'
       use_autocast: AMP on CUDA
@@ -62,9 +65,6 @@ class OSNetEmbedder:
       revision: optional HF revision/commit to pin
       verbose: print hints
     """
-    # --- replace your current __init__ signature & amp dtype setup with this ---
-
-class OSNetEmbedder:
     def __init__(self,
                  model_name: str = "osnet_x1_0",
                  image_size: Tuple[int, int] = (256, 128),
@@ -75,8 +75,8 @@ class OSNetEmbedder:
                  hf_file: Optional[str] = None,
                  revision: Optional[str] = None,
                  verbose: bool = True,
-                 amp_dtype: Optional[object] = None,   # <-- NEW: accept amp_dtype
-                 **kwargs):                              # <-- NEW: swallow any future extras
+                 amp_dtype: Optional[object] = None,   # accept amp_dtype
+                 **kwargs):                              # swallow future extras
 
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.model_name, self.verbose = model_name, verbose
@@ -91,22 +91,24 @@ class OSNetEmbedder:
                 amp_dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(amp_dtype.lower(), torch.float32)
             self._amp_dtype = amp_dtype
 
-        # If --embed-model looks like an HF spec, parse it and fill hf_repo/file/revision.
-        repo_auto, file_auto, rev_auto = parse_hf_spec(self.model_name)
-        if repo_auto:
-            hf_repo = hf_repo or repo_auto
+        # If --embed-model looks like an HF spec, parse it and fill hf_repo/file/revision/repo_type.
+        repo_id, file_auto, rev_auto, repo_type = parse_hf_spec(self.model_name)
+        if repo_id:
+            hf_repo = hf_repo or repo_id
             hf_file = hf_file or file_auto
             revision = revision or rev_auto
 
             # If model_name was a repo spec (not a bare arch), set a sensible default arch,
             # then optionally infer arch from the filename.
-            if ("/" in self.model_name) or self.model_name.startswith("hf:"):
+            if ("/" in self.model_name) or self.model_name.startswith(("hf:", "spaces/", "datasets/", "models/")):
                 self.model_name = "osnet_x1_0"
             if hf_file:
                 for arch in ("osnet_ain_x1_0", "osnet_ibn_x1_0", "osnet_x1_0", "osnet_x0_75", "osnet_x0_5", "osnet_x0_25"):
                     if arch in hf_file:
                         self.model_name = arch
                         break
+        else:
+            repo_type = None  # not an HF spec
 
         # Normalization (ImageNet)
         self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
@@ -145,7 +147,7 @@ class OSNetEmbedder:
             # If hf_file not given, try to auto-pick a .pt/.pth that mentions 'osnet'
             if hf_file is None:
                 try:
-                    files = HfApi().list_repo_files(repo_id=hf_repo, revision=revision)
+                    files = HfApi().list_repo_files(repo_id=hf_repo, repo_type=repo_type, revision=revision)
                     cands = [f for f in files if f.lower().endswith((".pt", ".pth")) and "osnet" in f.lower()]
                     # Prefer ReID dataset–trained weights if present
                     priority = ["msmt", "market", "duke", "imagenet"]
@@ -161,7 +163,11 @@ class OSNetEmbedder:
             if hf_file:
                 try:
                     weight_path = hf_hub_download(
-                        repo_id=hf_repo, filename=hf_file, revision=revision, token=get_hf_token()
+                        repo_id=hf_repo,
+                        repo_type=repo_type,    # pass repo_type for spaces/datasets
+                        filename=hf_file,
+                        revision=revision,
+                        token=get_hf_token(),
                     )
                 except Exception as e:
                     raise RuntimeError(f"Failed to download {hf_repo}/{hf_file} from Hugging Face: {e}")
@@ -187,7 +193,6 @@ class OSNetEmbedder:
                 elif z.ndim == 4:
                     self.emb_dim = int(torch.mean(z, dim=(2, 3)).shape[1])
                 else:
-                    # Fallback: flatten last dim
                     self.emb_dim = int(z.view(z.size(0), -1).shape[1])
             elif isinstance(z, (tuple, list)) and z and isinstance(z[0], torch.Tensor):
                 zz = z[0]

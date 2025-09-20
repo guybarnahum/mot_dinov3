@@ -21,53 +21,64 @@ def load_with_token(factory, repo_id: str, **extra):
     except TypeError:
         return factory(repo_id, use_auth_token=tok, **extra) if tok else factory(repo_id, **extra)
 
-def parse_hf_spec(spec: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+def parse_hf_spec(spec: Optional[str]):
     """
-    Parse a Hugging Face spec string.
+    Parse a compact Hugging Face spec and return (repo_id, file, revision, repo_type).
 
-    Accepted forms:
-      - 'org/repo'
-      - 'org/repo@rev'
-      - 'org/repo#sub/dir/file.pth'
-      - 'org/repo#sub/dir/file.pth@rev'
-      - 'hf:org/repo:sub/dir/file.pth'            (optionally '@rev' at end)
-      - 'hf:org/repo'                             (optionally '@rev' at end)
+    ACCEPTED FORMS
+      - "org/repo"
+      - "org/repo@rev"
+      - "org/repo#sub/dir/file.pth"
+      - "org/repo#sub/dir/file.pth@rev"
+      - "hf:org/repo[:sub/dir/file.pth][@rev]"
+      - "spaces/owner/name#path@rev"      -> repo_type='space'
+      - "datasets/owner/name#path@rev"    -> repo_type='dataset'
+      - "models/owner/name#path@rev"      -> repo_type=None (model; default)
 
-    Returns: (repo, file_or_None, revision_or_None)
-             If `spec` doesn't look like an HF spec, returns (None, None, None).
+    Returns:
+      (repo_id, file, revision, repo_type)  # repo_type in {None, 'space', 'dataset'}
     """
-    if not isinstance(spec, str) or "/" not in spec and not spec.startswith("hf:"):
-        return None, None, None
+    if not spec or "/" not in spec:
+        return (None, None, None, None)
 
-    if spec.startswith("hf:"):
-        body = spec[3:]
-        if "@" in body:
-            left, rev = body.rsplit("@", 1)
-        else:
-            left, rev = body, None
-        if ":" in left:
-            repo, file = left.split(":", 1)
-        else:
-            repo, file = left, None
-        return repo or None, (file or None), (rev or None)
+    s = spec.strip()
 
-    # Non 'hf:' forms: 'org/repo[#file][@rev]'
-    rev = None
-    if "@" in spec:
-        left, rev = spec.rsplit("@", 1)
-    else:
-        left = spec
+    # Strip optional "hf:" prefix
+    if s.startswith("hf:"):
+        s = s[3:]
 
-    if "#" in left:
-        repo, file = left.split("#", 1)
-    else:
-        repo, file = left, None
+    repo_type = None
+    # Normalize known type prefixes and strip them from the repo id
+    for prefix, rtype in (
+        ("spaces/", "space"), ("space/", "space"),
+        ("datasets/", "dataset"), ("dataset/", "dataset"),
+        ("models/", None), ("model/", None),
+    ):
+        if s.startswith(prefix):
+            s = s[len(prefix):]
+            repo_type = rtype
+            break
 
-    # basic sanity: must look like 'org/repo'
-    if "/" not in repo:
-        return None, None, None
-    return repo, (file or None), (rev or None)
-    
+    # Split file part: prefer '#', but also accept a single ':' (hf:org/repo:sub/file)
+    repo_part, file_part = s, None
+    if "#" in s:
+        repo_part, file_part = s.split("#", 1)
+    elif ":" in s and s.count(":") == 1:
+        repo_part, file_part = s.split(":", 1)
+
+    # Extract revision: can be after file or after repo
+    revision = None
+    if file_part and "@" in file_part:
+        file_part, revision = file_part.rsplit("@", 1)
+    elif "@" in repo_part:
+        repo_part, revision = repo_part.rsplit("@", 1)
+
+    repo_id = repo_part.strip() if repo_part else None
+    file_path = file_part.strip() if file_part else None
+    rev = revision.strip() if revision else None
+
+    return (repo_id or None, file_path or None, rev or None, repo_type)
+  
 def pick_amp_dtype() -> torch.dtype:
     try:
         return torch.bfloat16 if getattr(torch.cuda, "is_bf16_supported", lambda: False)() else torch.float16
