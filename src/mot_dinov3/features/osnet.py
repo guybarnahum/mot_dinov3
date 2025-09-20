@@ -3,7 +3,7 @@ from __future__ import annotations
 from ..embedders import create_embedder
 from .base import GenericExtractor
 
-class TransReIDExtractor(GenericExtractor):
+class OSNetExtractor(GenericExtractor):
     def __init__(self, model_id: str, device: str, autocast: bool,
                  pad: float=0.08, square: bool=False, image_size=(256,128), **kwargs):
         e = create_embedder("osnet", model_name=model_id, device=device,
