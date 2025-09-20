@@ -94,10 +94,22 @@ class TransReIDEmbedder:  # implements BaseEmbedder
         return {key: x}
 
     def _extract_feat(self, out) -> torch.Tensor:
-        for k in ("feat","features","global_feat","pooler_output"):
-            if isinstance(out, dict) and k in out and out[k] is not None: return out[k]
-            if hasattr(out, k) and getattr(out, k) is not None: return getattr(out, k)
-        toks = getattr(out, "last_hidden_state", None)
-        if toks is None: raise RuntimeError("TransReID: no recognizable feature in forward output.")
-        return toks[:,1:,:].mean(1) if toks.shape[1]>1 else toks[:,0,:]
+        # Most TransReID impls return a tensor directly
+        if isinstance(out, torch.Tensor):
+            return out
+        # Some repos wrap it in a tuple/list (e.g., (feat, logits))
+        if isinstance(out, (tuple, list)) and len(out) and isinstance(out[0], torch.Tensor):
+            return out[0]
 
+        # Fallbacks for other HF-style outputs
+        for k in ("feat", "features", "global_feat", "pooler_output"):
+            if isinstance(out, dict) and k in out and out[k] is not None:
+                return out[k]
+            if hasattr(out, k) and getattr(out, k) is not None:
+                return getattr(out, k)
+
+        toks = getattr(out, "last_hidden_state", None)
+        if toks is not None:
+            return toks[:, 1:, :].mean(1) if toks.shape[1] > 1 else toks[:, 0, :]
+
+        raise RuntimeError("TransReID: no recognizable feature in forward output.")
