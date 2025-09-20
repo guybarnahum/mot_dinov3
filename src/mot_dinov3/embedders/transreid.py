@@ -1,5 +1,6 @@
 # src/mot_dinov3/embedders/transreid.py
 from __future__ import annotations
+import inspect
 import numpy as np, torch
 from typing import List, Dict, Optional, Tuple
 try:
@@ -59,19 +60,38 @@ class TransReIDEmbedder:  # implements BaseEmbedder
             out = self.model(**self._prep_inputs([dummy]))
             feat = self._extract_feat(out)
             self.emb_dim = int(feat.shape[-1])
+    
+    def _forward_arg_name(self) -> str:
+        """
+        Inspect the model.forward signature and pick the expected tensor arg name.
+        Common names in ReID ports: 'x', 'img', 'images', 'pixel_values'.
+        """
+        try:
+            sig = inspect.signature(self.model.forward)
+            for name in ("x", "img", "images", "pixel_values", "inputs", "input"):
+                if name in sig.parameters:
+                    return name
+        except Exception:
+            pass
+        return "x"  # safe default for TransReID-style repos
 
     def _prep_inputs(self, pil_images: List[Image.Image]) -> Dict[str, torch.Tensor]:
         if self.processor is not None:
             batch = self.processor(images=pil_images, return_tensors="pt")
-            return {k:v.to(self.device, non_blocking=True) for k,v in batch.items()}
-        H,W = self.image_size; arrs=[]
+            return {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
+
+        H, W = self.image_size
+        arrs = []
         for im in pil_images:
-            im = im.resize((W, H), Resample.BICUBIC)
-            a = np.asarray(im, dtype=np.float32)/255.0
-            a = (a - self.mean)/self.std
-            arrs.append(a.transpose(2,0,1))
+            im = im.resize((W, H), Image.BICUBIC)
+            a = np.asarray(im, dtype=np.float32) / 255.0
+            a = (a - self.mean) / self.std
+            arrs.append(a.transpose(2, 0, 1))  # CHW
         x = torch.from_numpy(np.stack(arrs)).to(self.device, non_blocking=True)
-        return {"pixel_values": x}
+
+        key = getattr(self, "_fwd_key", None) or self._forward_arg_name()
+        self._fwd_key = key  # cache once
+        return {key: x}
 
     def _extract_feat(self, out) -> torch.Tensor:
         for k in ("feat","features","global_feat","pooler_output"):
