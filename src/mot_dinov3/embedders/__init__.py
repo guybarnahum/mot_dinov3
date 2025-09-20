@@ -1,16 +1,17 @@
 # src/mot_dinov3/embedders/__init__.py
 from .dino import DinoV3Embedder
+
 try:
     from .transreid import TransReIDEmbedder
 except Exception:
-    TransReIDEmbedder = None
+    TransReIDEmbedder = None  # optional
 
-#try:
-    from .osnet import OSNetEmbedder           
-#except Exception:
-#    OSNetEmbedder = None
+try:
+    from .osnet import OSNetEmbedder
+except Exception:
+    OSNetEmbedder = None      # optional
 
-from .base import GatedModelAccessError, parse_hf_spec 
+from .base import GatedModelAccessError, parse_hf_spec
 
 _REG = {
     "dino": DinoV3Embedder, "dinov3": DinoV3Embedder, "dinov2": DinoV3Embedder,
