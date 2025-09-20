@@ -26,6 +26,7 @@ dependencies = [
   "accelerate>=0.31.0",
   "python-dotenv>=1.0.1",
   "tomli; python_version < '3.11'",
+  "torchreid>=0.2.5"                      # for OSNet
 ]
 
 # Install variants

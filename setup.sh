@@ -266,6 +266,12 @@ case "$VARIANT" in
     ;;
 esac
 
+python - <<'PY' || { echo "OpenCV not found; installing headless (pinned)…"; pip install "opencv-python-headless==4.9.0.80" "numpy<2"; }
+from importlib.util import find_spec
+assert find_spec("cv2") is not None, "cv2 missing"
+print("cv2 import OK")
+PY
+
 # ---------------- Step 5.5: Enable DINOv3 support (Transformers) ----------------
 pick_dinov3_mode() {
   if [[ -n "$DINOV3_MODE" ]]; then
