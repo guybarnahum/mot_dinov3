@@ -13,33 +13,37 @@ except Exception:
     # then use Resample.BICUBIC
 
 from transformers import AutoModel, AutoImageProcessor
-from .base import BaseEmbedder, pick_amp_dtype, GatedModelAccessError, load_with_token
+from .base import BaseEmbedder, pick_amp_dtype, GatedModelAccessError, load_with_token,parse_hf_spec
 
 class TransReIDEmbedder:  # implements BaseEmbedder
     def __init__(self, model_name: str="your-hf-user/transreid-vit-s",
                  device: Optional[str]=None, use_autocast: bool=True,
-                 image_size: Tuple[int,int]=(384,128), verbose: bool=True):
+                 image_size: Tuple[int,int]=(256,128), verbose: bool=True):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.model_name, self.verbose = model_name, verbose
         self.use_autocast = use_autocast and (self.device == "cuda") and torch.cuda.is_available()
         self.image_size = image_size  # (H,W)
 
-                # --- Load model first (we can still run manual preprocessing) ---
+        # --- Load model first (handle HF @revision in model_name and gated repos) ---
+        repo, _file_unused, rev = parse_hf_spec(model_name)  # e.g., "org/repo@<rev>"
+        model_id = repo or model_name                         # ignore "#file" for AutoModel
+        extra = {"trust_remote_code": True}
+        if rev:
+            extra["revision"] = rev
+
         try:
             self.model = load_with_token(
-                AutoModel.from_pretrained, model_name, trust_remote_code=True
+                AutoModel.from_pretrained, model_id, **extra
             ).to(self.device).eval()
         except Exception as e:
             msg = str(e).lower()
             if ("gated repo" in msg) or ("401" in msg and "huggingface" in msg) or ("access to model" in msg):
                 tips = (
-                    f"Model '{model_name}' is gated on Hugging Face.\n"
+                    f"Model '{model_id}' is gated (or requires access) on Hugging Face.\n"
                     "To use it:\n"
-                    "  1) Visit the model page while logged in and click “Agree/Request access”.\n"
-                    "  2) Provide an access token (recommended via .env):\n"
-                    "       HF_TOKEN=hf_xxx  # then `source .venv/bin/activate` and run again\n"
-                    "     Or log in once: `huggingface-cli login`.\n"
-                    "  3) Or choose an open fallback, e.g.: --dinov3 facebook/dinov2-base"
+                    "  1) Visit the model page and request/agree to access.\n"
+                    "  2) Provide a token (HF_TOKEN=hf_xxx) or run `huggingface-cli login`.\n"
+                    "  3) Or choose an open fallback (e.g., facebook/dinov2-base)."
                 )
                 if os.getenv("HF_HUB_DISABLE_IMPLICIT_TOKEN") in {"1", "ON", "YES", "TRUE"}:
                     tips += "\nNote: HF_HUB_DISABLE_IMPLICIT_TOKEN=1 is set; unset it or pass the token explicitly."

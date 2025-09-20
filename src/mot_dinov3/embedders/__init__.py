@@ -5,7 +5,12 @@ try:
 except Exception:
     TransReIDEmbedder = None
 
-from .base import GatedModelAccessError
+try:
+    from .osnet import OSNetEmbedder           
+except Exception:
+    OSNetEmbedder = None
+
+from .base import GatedModelAccessError, parse_hf_spec 
 
 _REG = {
     "dino": DinoV3Embedder, "dinov3": DinoV3Embedder, "dinov2": DinoV3Embedder,
