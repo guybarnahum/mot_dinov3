@@ -1,5 +1,6 @@
 # src/mot_dinov3/embedders/transreid.py
 from __future__ import annotations
+import os
 import inspect
 import numpy as np, torch
 from typing import List, Dict, Optional, Tuple
@@ -7,8 +8,9 @@ try:
     from PIL import Image
     Resample = Image.Resampling
 except Exception:
-    Resample = Image  # Pillow < 10
-# then use Resample.BICUBIC
+    from PIL import Image        # ensure Image is still defined
+    Resample = Image             # Pillow < 10
+    # then use Resample.BICUBIC
 
 from transformers import AutoModel, AutoImageProcessor
 from .base import BaseEmbedder, pick_amp_dtype, GatedModelAccessError, load_with_token
@@ -83,33 +85,61 @@ class TransReIDEmbedder:  # implements BaseEmbedder
         H, W = self.image_size
         arrs = []
         for im in pil_images:
-            im = im.resize((W, H), Image.BICUBIC)
+            im = im.resize((W, H), resample=Resample.BICUBIC)  # <-- use Resample
             a = np.asarray(im, dtype=np.float32) / 255.0
             a = (a - self.mean) / self.std
             arrs.append(a.transpose(2, 0, 1))  # CHW
-        x = torch.from_numpy(np.stack(arrs)).to(self.device, non_blocking=True)
+
+        x = torch.from_numpy(np.stack(arrs, axis=0)).to(dtype=torch.float32)
+        if self.device == "cuda":
+            x = x.pin_memory().to(self.device, non_blocking=True)
+        else:
+            x = x.to(self.device)
 
         key = getattr(self, "_fwd_key", None) or self._forward_arg_name()
-        self._fwd_key = key  # cache once
-        return {key: x}
+        self._fwd_key = key
+        return {key: x}                              # e.g., {"x": tensor} for HAPTransReID
+
 
     def _extract_feat(self, out) -> torch.Tensor:
-        # Most TransReID impls return a tensor directly
-        if isinstance(out, torch.Tensor):
-            return out
-        # Some repos wrap it in a tuple/list (e.g., (feat, logits))
-        if isinstance(out, (tuple, list)) and len(out) and isinstance(out[0], torch.Tensor):
-            return out[0]
 
-        # Fallbacks for other HF-style outputs
+        # 1) Direct tensor returns from forward()
+        if isinstance(out, torch.Tensor):
+            if out.ndim == 2:                      # [N, D]
+                return out
+            if out.ndim == 3:                      # [N, L, D] tokens
+                L = out.shape[1]
+                if L > 1:
+                    return out[:, 1:, :].mean(dim=1)   # drop CLS if present, then mean-pool
+                return out[:, 0, :]                    # degenerate token length
+
+        # 2) Tuple/list returns, e.g. (tokens, logits) or (feat, logits)
+        if isinstance(out, (tuple, list)) and len(out):
+            for t in out:
+                if isinstance(t, torch.Tensor):
+                    if t.ndim == 2:
+                        return t
+                    if t.ndim == 3 and t.shape[1] > 1:
+                        return t[:, 1:, :].mean(dim=1)
+            # fallthrough to dict/attr parsing if above didn't match
+
+        # 3) Dict-like or HF-style outputs
         for k in ("feat", "features", "global_feat", "pooler_output"):
             if isinstance(out, dict) and k in out and out[k] is not None:
-                return out[k]
+                v = out[k]
+                if isinstance(v, torch.Tensor) and v.ndim == 3 and v.shape[1] > 1:
+                    return v[:, 1:, :].mean(dim=1)
+                return v
             if hasattr(out, k) and getattr(out, k) is not None:
-                return getattr(out, k)
+                v = getattr(out, k)
+                if isinstance(v, torch.Tensor) and v.ndim == 3 and v.shape[1] > 1:
+                    return v[:, 1:, :].mean(dim=1)
+                return v
 
+        # 4) Last resort: pooled tokens from last_hidden_state
         toks = getattr(out, "last_hidden_state", None)
         if toks is not None:
-            return toks[:, 1:, :].mean(1) if toks.shape[1] > 1 else toks[:, 0, :]
+            return toks[:, 1:, :].mean(dim=1) if toks.shape[1] > 1 else toks[:, 0, :]
 
         raise RuntimeError("TransReID: no recognizable feature in forward output.")
+
