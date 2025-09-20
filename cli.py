@@ -7,6 +7,12 @@ parameters from a TOML configuration file and processing specific
 video segments defined by start and end frames.
 """
 import os
+
+os.environ.setdefault("YOLO_CONFIG_DIR", "/tmp/Ultralytics")          # avoids the Ultralytics “settings” chatter
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")            # no HF download bars
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")              # hush transformers
+os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+
 import argparse
 import sys
 from dataclasses import dataclass, field, asdict, fields, MISSING
