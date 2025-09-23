@@ -81,16 +81,14 @@ The decision process for each detected object is as follows:
 
 ```
 Detection
-    |
-    +--> Is it a stable track (high IoU match & not crowded)?
+    └--> Is it a stable track (high IoU match & not crowded)?
           |
-          +--> YES: Is the track's embedding stale (due for a refresh)?
-          |         |
-          |         +--> YES: Add to REFRESH backlog (processed if budget allows).
-          |         |
-          |         +--> NO: REUSE the cached embedding (almost zero cost).
+          ├─--> YES: Is the track's embedding stale (due for a refresh)?
+          |     |
+          |     ├─-> YES: Add to REFRESH backlog (processed if budget allows).
+          |     └--> NO: REUSE the cached embedding (almost zero cost).
           |
-          +--> NO: This is a CRITICAL detection (new object, crowded scene, etc.).
+          └--> NO: This is a CRITICAL detection (new object, crowded scene, etc.).
                     Compute the embedding immediately (ignores budget).
 ```
 
@@ -145,24 +143,36 @@ Below is a summary of the most important CLI arguments. For a full list, run `py
 
 ```
 .
+├─ README.md
 ├─ pyproject.toml
 ├─ setup.sh
 ├─ clean.sh
 ├─ .gitignore
-├─ .env                  # not committed (token/env)
+├─ .env.example          # .env not committed
 ├─ cli.py
-├─ src/
-│  └─ mot_dinov3/
-│     ├─ __init__.py
-│     ├─ compat.py       # small shims (torch.compiler, numpy guard, HF token bridge)
-│     ├─ embedder.py     # DINOv3/DINOv2 embeddings (gated handling + manual preproc fallback)
-│     ├─ detector.py     # Ultralytics detection
-│     ├─ features/       # pluggable embedding backends (factory.py, dino.py, clip.py, ...)
-│     ├─ scheduler.py    # embedding reuse/refresh + backlog + budget
-│     ├─ tracker.py      # IoU + cosine(DINO) + Hungarian (EMA embeddings)
-│     ├─ utils.py
-│     └─ viz.py          # colored boxes, labels; ‘*’ when embedding was computed this frame
-├─ data/                 # put your videos here (ignored; keep .gitkeep)
+├─ config.toml
+├── src
+│   └── mot_dinov3
+│      ├── __init__.py
+│      ├── compat.py      # small shims (torch.compiler, numpy guard, HF token bridge)
+│      ├── detector.py    # Ultralytics detection
+│       ├── embedders
+│       │   ├── __init__.py
+│       │   ├── base.py
+│       │   ├── dino.py
+│       │   ├── osnet.py
+│       │   └── transreid.py
+│       ├── features      # pluggable embedding backends (factory.py, dino.py, clip.py, ...)
+│       │   ├── base.py
+│       │   ├── dino.py
+│       │   ├── factory.py
+│       │   ├── osnet.py
+│       │   └── transreid.py
+│       ├── scheduler.py  # embedding reuse/refresh + backlog + budget
+│       ├── tracker.py    # IoU + cosine(DINO) + Hungarian (EMA embeddings)
+│       ├── utils.py
+│       └── viz.py        # colored boxes, labels; ‘*’ when embedding was computed this frame         
+├─ input/                # input videos here (ignored; keep .gitkeep)
 └─ outputs/              # results (ignored; keep .gitkeep)
 ```
 
