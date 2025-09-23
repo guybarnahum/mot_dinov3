@@ -150,5 +150,8 @@ def draw_reid_links(frame: np.ndarray, reid_events: List[Dict]):
 
         score = event['score']
         label = f"ID {tid} [Re-ID: {score:.2f}]"
+        
         # --- ENHANCED: Use a bright, distinct background for the Re-ID label ---
-        _draw_label(frame, label, (new_box[0], new_box[1]), color, font_scale=0.5, bg_color=(255, 255, 255))
+        label_height = 20 # Approximate height of a label in pixels
+        new_label_pos = (new_box[0], new_box[1] - label_height) 
+        _draw_label(frame, label, new_label_pos, color, font_scale=0.5, bg_color=(255, 255, 255))
