@@ -6,6 +6,8 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
+DEBUG_PANEL_HEIGHT = 256
+
 # ---------- Color helpers ----------
 
 def _hsv_to_rgb(h: float, s: float, v: float) -> Tuple[float, float, float]:
@@ -238,8 +240,7 @@ def create_enhanced_frame(
 ) -> np.ndarray:
     """Creates a single large frame with the main view and debug panels."""
     frame_h, frame_w = frame.shape[:2]
-    # --- MODIFIED: Increased panel height for larger thumbnails ---
-    panel_h = 200
+    panel_h = DEBUG_PANEL_HEIGHT
 
     canvas = np.zeros((frame_h + panel_h * 2, frame_w, 3), dtype=np.uint8)
     canvas[:frame_h, :, :] = frame

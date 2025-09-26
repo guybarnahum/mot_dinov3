@@ -49,9 +49,11 @@ from mot_dinov3.embedders import GatedModelAccessError
 from mot_dinov3.features.factory import create_extractor
 from mot_dinov3.scheduler import EmbeddingScheduler
 from mot_dinov3.tracker import SimpleTracker
-# --- UPDATED: Import the new master visualization function ---
-from mot_dinov3.viz import draw_tracks, draw_hud, draw_reid_links, create_enhanced_frame
 
+from mot_dinov3.viz import (
+    create_enhanced_frame, draw_tracks, draw_hud, 
+    draw_reid_links, DEBUG_PANEL_HEIGHT
+)
 
 # --- Configuration Dataclasses ---
 
@@ -242,7 +244,6 @@ def parse_and_merge_config() -> Config:
 
 # --- Core Application Logic ---
 
-# --- UPDATED: Function signature to accept viz_cfg for resizing ---
 def setup_video_io(io_cfg: IOParams, viz_cfg: VizParams, meta: Dict[str, Any]) -> Tuple[cv2.VideoCapture, cv2.VideoWriter]:
     """Initializes video capture and writer objects, resizing for debug panels if needed."""
     cap = cv2.VideoCapture(io_cfg.source)
@@ -252,14 +253,12 @@ def setup_video_io(io_cfg: IOParams, viz_cfg: VizParams, meta: Dict[str, Any]) -
     meta["out_fps"] = io_cfg.fps if io_cfg.fps > 0 else meta["src_fps"]
     
     if io_cfg.start_frame > 0:
-        if io_cfg.start_frame >= meta["total_frames"]: raise ValueError(f"Start frame ({io_cfg.start_frame}) is after the end of the video ({meta['total_frames']})")
         cap.set(cv2.CAP_PROP_POS_FRAMES, io_cfg.start_frame)
         
     out_w, out_h = meta["width"], meta["height"]
-    # --- NEW: Adjust output height if debug panels are enabled ---
+    # --- MODIFIED: Use the imported constant to calculate the exact height ---
     if viz_cfg.debug_panels:
-        PANEL_HEIGHT = 150  # Must match the value in viz.py
-        out_h += PANEL_HEIGHT * 2
+        out_h += DEBUG_PANEL_HEIGHT * 2
         print(f"💡 Debug panels enabled. Output resolution set to {out_w}x{out_h}.")
 
     fourcc, out_dir = cv2.VideoWriter_fourcc(*"mp4v"), os.path.dirname(io_cfg.output)
@@ -269,6 +268,7 @@ def setup_video_io(io_cfg: IOParams, viz_cfg: VizParams, meta: Dict[str, Any]) -
     if not writer.isOpened(): raise RuntimeError(f"Could not open video writer for: {io_cfg.output}")
     
     return cap, writer
+    
 
 def initialize_components(cfg: Config, device: str) -> Dict[str, object]:
     """Initializes all the main processing modules."""
