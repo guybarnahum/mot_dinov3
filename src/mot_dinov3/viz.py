@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-DEBUG_PANEL_HEIGHT = 256
+DEBUG_PANEL_HEIGHT = 200
 
 # ---------- Color helpers ----------
 
