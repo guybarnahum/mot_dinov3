@@ -7,8 +7,8 @@ import cv2
 import numpy as np
 
 # --- Public constants for easy tuning of the debug view ---
-DEBUG_PANEL_HEIGHT = 200
-DEBUG_THUMBNAIL_SIZE = (120, 120)
+DEBUG_PANEL_HEIGHT = 256
+DEBUG_THUMBNAIL_SIZE = (180, 180)
 
 # ---------- Color helpers ----------
 
