@@ -194,7 +194,7 @@ def draw_hud(frame: np.ndarray, stats: Dict):
         draw_text("  Active", stats['Tracker'].get('Active', 'N/A'))
         draw_text("  Lost", stats['Tracker'].get('Lost', 'N/A'))
 
-        
+
 def draw_reid_links(frame: np.ndarray, reid_events: List[Dict], tracks: list):
     """Draws visual links for Re-ID events, now using state-based color."""
     tid_to_track = {t.tid: t for t in tracks}
@@ -212,6 +212,7 @@ def draw_reid_links(frame: np.ndarray, reid_events: List[Dict], tracks: list):
         cv2.circle(frame, c_new, 6, color, -1, cv2.LINE_AA)
         _draw_label(frame, f"Re-ID: {event['score']:.2f}", c_new, color)
 
+
 def create_enhanced_frame(
     frame: np.ndarray, 
     tracks: list,
@@ -223,11 +224,12 @@ def create_enhanced_frame(
     Creates a single large frame with the main view and debug panels.
     This is the new primary function to call for visualization.
     """
-    frame_h, frame_h = frame.shape[:2]
+    # --- CORRECTED: Correctly unpack frame height and width ---
+    frame_h, frame_w = frame.shape[:2]
     panel_h = 150  # Height for each debug panel
 
-    # Create a new, taller canvas
-    canvas = np.zeros((frame_h + panel_h * 2, frame_h, 3), dtype=np.uint8)
+    # --- CORRECTED: Use the correct frame_w for the canvas width ---
+    canvas = np.zeros((frame_h + panel_h * 2, frame_w, 3), dtype=np.uint8)
     canvas[:frame_h, :, :] = frame
     
     # 1. Draw main tracks, search areas, and re-id links onto the top frame part
@@ -241,5 +243,8 @@ def create_enhanced_frame(
     # 3. Draw the Re-ID Debug panel
     reid_panel_y_start = frame_h + panel_h
     _draw_reid_debug_panel(canvas, reid_debug_info, reid_panel_y_start, panel_h)
+    
+    # 4. Draw the HUD on top of everything
+    draw_hud(canvas, hud_stats) 
 
     return canvas
