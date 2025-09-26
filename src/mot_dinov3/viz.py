@@ -166,6 +166,35 @@ def draw_tracks(frame: np.ndarray, tracks: list, tracker_config: dict):
         label = f"ID {t.tid}"
         _draw_label(frame, label, (x1, y1), color)
 
+def draw_hud(frame: np.ndarray, stats: Dict):
+    """Draws a Heads-Up Display with system statistics."""
+    font, font_scale, thickness, color = cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1, (255, 255, 255)
+    x, y, line_h = 10, 20, 18
+    
+    # Create a semi-transparent background for the HUD
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (0, 0), (220, 120), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+
+    def draw_text(text, val=""):
+        nonlocal y
+        full_text = f"{text}: {val}" if val else text
+        cv2.putText(frame, full_text, (x, y), font, font_scale, color, thickness, cv2.LINE_AA)
+        y += line_h
+
+    draw_text("Frame", stats.get('Frame', 'N/A'))
+    draw_text("FPS", f"{stats.get('FPS', 0):.1f}")
+    if 'Scheduler' in stats:
+        y += 5; draw_text("-- Scheduler --")
+        draw_text("  Budget", stats['Scheduler'].get('Budget', 'N/A'))
+        draw_text("  Backlog", stats['Scheduler'].get('Backlog', 'N/A'))
+        draw_text("  Actions", stats['Scheduler'].get('Actions', 'N/A'))
+    if 'Tracker' in stats:
+        y += 5; draw_text("-- Tracker --")
+        draw_text("  Active", stats['Tracker'].get('Active', 'N/A'))
+        draw_text("  Lost", stats['Tracker'].get('Lost', 'N/A'))
+
+        
 def draw_reid_links(frame: np.ndarray, reid_events: List[Dict], tracks: list):
     """Draws visual links for Re-ID events, now using state-based color."""
     tid_to_track = {t.tid: t for t in tracks}
