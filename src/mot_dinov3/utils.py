@@ -29,6 +29,7 @@ def iou_matrix(boxes1: np.ndarray, boxes2: np.ndarray) -> np.ndarray:
 
     return (inter_area / (union_area + 1e-6)).astype(np.float32)
 
+
 def cosine_cost_matrix(A: np.ndarray, B: np.ndarray) -> np.ndarray:
     """
     Calculates the cosine distance (1 - similarity) between two sets of
@@ -46,6 +47,7 @@ def cosine_cost_matrix(A: np.ndarray, B: np.ndarray) -> np.ndarray:
     # Cost is 1 - similarity
     return (1.0 - similarity).astype(np.float32)
 
+
 def centers_xyxy(b: np.ndarray) -> np.ndarray:
     """Calculates the centers of boxes in XYXY format."""
     if len(b) == 0:
@@ -53,3 +55,24 @@ def centers_xyxy(b: np.ndarray) -> np.ndarray:
     cx = (b[:, 0] + b[:, 2]) * 0.5
     cy = (b[:, 1] + b[:, 2]) * 0.5
     return np.stack([cx, cy], axis=1).astype(np.float32)
+
+
+def get_crop(frame: np.ndarray, box: np.ndarray) -> np.ndarray:
+    """
+    Crops a region from the frame based on the bounding box,
+    ensuring the coordinates are within the frame's boundaries.
+    """
+    x1, y1, x2, y2 = box.astype(int)
+    h, w = frame.shape[:2]
+    
+    # Clamp coordinates to be within the frame dimensions
+    x1_c = max(0, x1)
+    y1_c = max(0, y1)
+    x2_c = min(w, x2)
+    y2_c = min(h, y2)
+    
+    # Return an empty array if the box is invalid or out of bounds
+    if x1_c >= x2_c or y1_c >= y2_c:
+        return np.array([[]], dtype=frame.dtype)
+        
+    return frame[y1_c:y2_c, x1_c:x2_c]
