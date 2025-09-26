@@ -289,6 +289,9 @@ def run_processing_loop(cfg: Config, cap: cv2.VideoCapture, writer: cv2.VideoWri
     fps_tracker = deque(maxlen=30)
     prev_reuse_count, prev_real_count = 0, 0
     
+    # Pre-convert config dataclasses to dicts for easy use
+    tracker_config_dict = asdict(cfg.tracker)
+    
     desc = f"Tracking [{device}] frames {cfg.io.start_frame} to {cfg.io.end_frame or 'end'}"
     with tqdm(total=frames_to_process, unit="frame", dynamic_ncols=True, desc=desc) as pbar:
         while frame_idx < end_frame:
@@ -309,7 +312,6 @@ def run_processing_loop(cfg: Config, cap: cv2.VideoCapture, writer: cv2.VideoWri
             )
             stats.stage_timers["embed"] += t_emb
 
-            # --- UPDATED: Tracker now requires 'frame' and returns 'reid_debug_info' ---
             t = perf_counter()
             tracks, reid_events, reid_debug_info = components["tracker"].update(
                 det_boxes=boxes, det_embs=embs, frame=frame, confs=confs, clses=clses
@@ -317,23 +319,7 @@ def run_processing_loop(cfg: Config, cap: cv2.VideoCapture, writer: cv2.VideoWri
             stats.stage_timers["track"] += perf_counter() - t
 
             t = perf_counter()
-            output_frame = frame # Start with the original frame
-
-            # --- NEW: Conditional logic for advanced vs. simple visualization ---
-            if cfg.viz.debug_panels:
-                tracker_config_dict = asdict(cfg.tracker)
-                output_frame = create_enhanced_frame(
-                    frame, tracks, reid_events, reid_debug_info, tracker_config_dict
-                )
-            else:
-                # Original, simpler visualization
-                draw_tracks(output_frame, tracks, draw_lost=cfg.viz.draw_lost, thickness=cfg.viz.line_thickness,
-                            font_scale=cfg.viz.font_scale, viz_info=viz_info)
-                
-                if cfg.viz.viz_reid and reid_events:
-                    draw_reid_links(output_frame, reid_events, tracks) # Pass tracks for color state
-
-            # HUD is drawn on both modes
+            hud_stats = {}
             if cfg.viz.viz_hud:
                 active_count = sum(1 for tr in tracks if getattr(tr, 'state', None) == 'active')
                 lost_count = len(tracks) - active_count
@@ -346,7 +332,23 @@ def run_processing_loop(cfg: Config, cap: cv2.VideoCapture, writer: cv2.VideoWri
                     },
                     'Tracker': {'Active': active_count, 'Lost': lost_count}
                 }
-                draw_hud(output_frame, hud_stats)
+
+            if cfg.viz.debug_panels:
+                output_frame = create_enhanced_frame(
+                    frame, tracks, reid_events, reid_debug_info, tracker_config_dict, hud_stats
+                )
+            else:
+                # --- FIX #2: Use the corrected function calls for simple visualization ---
+                output_frame = frame
+                # The new draw_tracks function uses the config dict and internally handles drawing lost tracks
+                draw_tracks(output_frame, tracks, tracker_config_dict)
+                
+                if cfg.viz.viz_reid and reid_events:
+                    draw_reid_links(output_frame, reid_events, tracks)
+
+                if cfg.viz.viz_hud:
+                    draw_hud(output_frame, hud_stats)
+            
             stats.stage_timers["draw"] += perf_counter() - t
 
             t = perf_counter(); writer.write(output_frame); stats.stage_timers["write"] += perf_counter() - t
@@ -354,7 +356,8 @@ def run_processing_loop(cfg: Config, cap: cv2.VideoCapture, writer: cv2.VideoWri
             stats.frame_times.append(perf_counter() - f0)
             fps_tracker.append(perf_counter() - f0)
             
-            prev_reuse_count, prev_real_count = components["scheduler"].stat_reuse
+            # --- FIX #1: Correctly assign state variables on separate lines ---
+            prev_reuse_count = components["scheduler"].stat_reuse
             prev_real_count = components["scheduler"].stat_real
 
             frame_idx += 1

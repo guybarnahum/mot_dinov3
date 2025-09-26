@@ -213,26 +213,27 @@ def draw_reid_links(frame: np.ndarray, reid_events: List[Dict], tracks: list):
         _draw_label(frame, f"Re-ID: {event['score']:.2f}", c_new, color)
 
 
+# In src/mot_dinov3/viz.py
+
 def create_enhanced_frame(
     frame: np.ndarray, 
     tracks: list,
     reid_events: List[Dict],
     reid_debug_info: dict,
-    tracker_config: dict
+    tracker_config: dict,
+    hud_stats: dict  
 ) -> np.ndarray:
     """
     Creates a single large frame with the main view and debug panels.
     This is the new primary function to call for visualization.
     """
-    # --- CORRECTED: Correctly unpack frame height and width ---
     frame_h, frame_w = frame.shape[:2]
-    panel_h = 150  # Height for each debug panel
+    panel_h = 150
 
-    # --- CORRECTED: Use the correct frame_w for the canvas width ---
     canvas = np.zeros((frame_h + panel_h * 2, frame_w, 3), dtype=np.uint8)
     canvas[:frame_h, :, :] = frame
     
-    # 1. Draw main tracks, search areas, and re-id links onto the top frame part
+    # 1. Draw main tracks, search areas, and re-id links
     draw_tracks(canvas, tracks, tracker_config)
     draw_reid_links(canvas, reid_events, tracks)
 
@@ -244,7 +245,8 @@ def create_enhanced_frame(
     reid_panel_y_start = frame_h + panel_h
     _draw_reid_debug_panel(canvas, reid_debug_info, reid_panel_y_start, panel_h)
     
-    # 4. Draw the HUD on top of everything
-    draw_hud(canvas, hud_stats) 
+    # 4. Draw the HUD on top of the final canvas
+    if hud_stats: 
+        draw_hud(canvas, hud_stats)
 
     return canvas
