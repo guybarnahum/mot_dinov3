@@ -49,7 +49,8 @@ from mot_dinov3.embedders import GatedModelAccessError
 from mot_dinov3.features.factory import create_extractor
 from mot_dinov3.scheduler import EmbeddingScheduler
 from mot_dinov3.tracker import SimpleTracker
-from mot_dinov3.viz import draw_tracks, draw_hud, draw_reid_links
+# --- UPDATED: Import the new master visualization function ---
+from mot_dinov3.viz import draw_tracks, draw_hud, draw_reid_links, create_enhanced_frame
 
 
 # --- Configuration Dataclasses ---
@@ -105,13 +106,14 @@ class TrackerParams:
     conf_min_update: float = 0.3
     conf_update_weight: float = 0.5
     low_conf_iou_only: bool = True
-    # --- ENHANCED: Motion gating and extrapolation parameters ---
     motion_gate: bool = True
-    extrapolation_window: int = 30 # Frames to use velocity extrapolation
+    extrapolation_window: int = 30
     center_gate_base: float = 50.0
     center_gate_slope: float = 10.0
     class_vote_smoothing: float = 0.6
     class_decay_factor: float = 0.05
+    # --- NEW: Parameter for enabling debug info in the tracker ---
+    reid_debug_k: int = 3
 
 @dataclass
 class VizParams:
@@ -121,6 +123,8 @@ class VizParams:
     viz_reasons: bool = False
     viz_hud: bool = False
     viz_reid: bool = False
+    # --- NEW: Add a flag to enable the advanced debug panels ---
+    debug_panels: bool = False
 
 @dataclass
 class SystemParams:
@@ -147,9 +151,9 @@ class Stats:
         "track": 0.0, "draw": 0.0, "write": 0.0,
     })
 
-# --- Argument Parsing and Configuration ---
+# --- Argument Parsing and Configuration (No changes needed here) ---
 def _create_arg_parser() -> argparse.ArgumentParser:
-    """Creates the argument parser with all CLI options."""
+    # This function is correct and will automatically handle the new CLI options.
     ap = argparse.ArgumentParser(description="DINOv3-based MOT with config file support.")
     
     ap.add_argument("-c", "--config", type=str, help="Path to a TOML configuration file")
@@ -235,22 +239,35 @@ def parse_and_merge_config() -> Config:
                 setattr(getattr(final_config, section_name), field_info.name, value)
 
     return final_config
-    
+
 # --- Core Application Logic ---
 
-def setup_video_io(cfg: IOParams, meta: Dict[str, Any]) -> Tuple[cv2.VideoCapture, cv2.VideoWriter]:
-    """Initializes video capture and writer objects."""
-    cap = cv2.VideoCapture(cfg.source)
-    if not cap.isOpened(): raise RuntimeError(f"Could not open video source: {cfg.source}")
+# --- UPDATED: Function signature to accept viz_cfg for resizing ---
+def setup_video_io(io_cfg: IOParams, viz_cfg: VizParams, meta: Dict[str, Any]) -> Tuple[cv2.VideoCapture, cv2.VideoWriter]:
+    """Initializes video capture and writer objects, resizing for debug panels if needed."""
+    cap = cv2.VideoCapture(io_cfg.source)
+    if not cap.isOpened(): raise RuntimeError(f"Could not open video source: {io_cfg.source}")
+    
     meta.update({ "width": int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), "height": int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), "src_fps": cap.get(cv2.CAP_PROP_FPS) or 30.0, "total_frames": int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) })
-    meta["out_fps"] = cfg.fps if cfg.fps > 0 else meta["src_fps"]
-    if cfg.start_frame > 0:
-        if cfg.start_frame >= meta["total_frames"]: raise ValueError(f"Start frame ({cfg.start_frame}) is after the end of the video ({meta['total_frames']})")
-        cap.set(cv2.CAP_PROP_POS_FRAMES, cfg.start_frame)
-    fourcc, out_dir = cv2.VideoWriter_fourcc(*"mp4v"), os.path.dirname(cfg.output)
+    meta["out_fps"] = io_cfg.fps if io_cfg.fps > 0 else meta["src_fps"]
+    
+    if io_cfg.start_frame > 0:
+        if io_cfg.start_frame >= meta["total_frames"]: raise ValueError(f"Start frame ({io_cfg.start_frame}) is after the end of the video ({meta['total_frames']})")
+        cap.set(cv2.CAP_PROP_POS_FRAMES, io_cfg.start_frame)
+        
+    out_w, out_h = meta["width"], meta["height"]
+    # --- NEW: Adjust output height if debug panels are enabled ---
+    if viz_cfg.debug_panels:
+        PANEL_HEIGHT = 150  # Must match the value in viz.py
+        out_h += PANEL_HEIGHT * 2
+        print(f"💡 Debug panels enabled. Output resolution set to {out_w}x{out_h}.")
+
+    fourcc, out_dir = cv2.VideoWriter_fourcc(*"mp4v"), os.path.dirname(io_cfg.output)
     if out_dir: os.makedirs(out_dir, exist_ok=True)
-    writer = cv2.VideoWriter(cfg.output, fourcc, meta["out_fps"], (meta["width"], meta["height"]))
-    if not writer.isOpened(): raise RuntimeError(f"Could not open video writer for: {cfg.output}")
+    
+    writer = cv2.VideoWriter(io_cfg.output, fourcc, meta["out_fps"], (out_w, out_h))
+    if not writer.isOpened(): raise RuntimeError(f"Could not open video writer for: {io_cfg.output}")
+    
     return cap, writer
 
 def initialize_components(cfg: Config, device: str) -> Dict[str, object]:
@@ -292,41 +309,52 @@ def run_processing_loop(cfg: Config, cap: cv2.VideoCapture, writer: cv2.VideoWri
             )
             stats.stage_timers["embed"] += t_emb
 
-            t = perf_counter(); tracks, reid_events = components["tracker"].update(boxes, embs, confs=confs, clses=clses); stats.stage_timers["track"] += perf_counter() - t
+            # --- UPDATED: Tracker now requires 'frame' and returns 'reid_debug_info' ---
+            t = perf_counter()
+            tracks, reid_events, reid_debug_info = components["tracker"].update(
+                det_boxes=boxes, det_embs=embs, frame=frame, confs=confs, clses=clses
+            )
+            stats.stage_timers["track"] += perf_counter() - t
 
             t = perf_counter()
-            draw_tracks(frame, tracks, draw_lost=cfg.viz.draw_lost, thickness=cfg.viz.line_thickness,
-                        font_scale=cfg.viz.font_scale, viz_info=viz_info)
-            
-            if cfg.viz.viz_reid and reid_events:
-                draw_reid_links(frame, reid_events)
+            output_frame = frame # Start with the original frame
 
+            # --- NEW: Conditional logic for advanced vs. simple visualization ---
+            if cfg.viz.debug_panels:
+                tracker_config_dict = asdict(cfg.tracker)
+                output_frame = create_enhanced_frame(
+                    frame, tracks, reid_events, reid_debug_info, tracker_config_dict
+                )
+            else:
+                # Original, simpler visualization
+                draw_tracks(output_frame, tracks, draw_lost=cfg.viz.draw_lost, thickness=cfg.viz.line_thickness,
+                            font_scale=cfg.viz.font_scale, viz_info=viz_info)
+                
+                if cfg.viz.viz_reid and reid_events:
+                    draw_reid_links(output_frame, reid_events, tracks) # Pass tracks for color state
+
+            # HUD is drawn on both modes
             if cfg.viz.viz_hud:
                 active_count = sum(1 for tr in tracks if getattr(tr, 'state', None) == 'active')
                 lost_count = len(tracks) - active_count
-                
-                reuse_this_frame = components["scheduler"].stat_reuse - prev_reuse_count
-                real_this_frame = components["scheduler"].stat_real - prev_real_count
-                
                 hud_stats = {
-                    'Frame': frame_idx,
-                    'FPS': len(fps_tracker) / sum(fps_tracker) if fps_tracker else 0.0,
+                    'Frame': frame_idx, 'FPS': len(fps_tracker) / sum(fps_tracker) if fps_tracker else 0.0,
                     'Scheduler': {
                         'Budget': f"{1000 * t_emb:.1f}/{cfg.scheduler.embed_budget_ms:.1f}ms",
                         'Backlog': len(components["scheduler"].pending_refresh),
-                        'Actions': f"C:{real_this_frame}, R:{reuse_this_frame}"
+                        'Actions': f"C:{components['scheduler'].stat_real-prev_real_count}, R:{components['scheduler'].stat_reuse-prev_reuse_count}"
                     },
                     'Tracker': {'Active': active_count, 'Lost': lost_count}
                 }
-                draw_hud(frame, hud_stats)
+                draw_hud(output_frame, hud_stats)
             stats.stage_timers["draw"] += perf_counter() - t
 
-            t = perf_counter(); writer.write(frame); stats.stage_timers["write"] += perf_counter() - t
+            t = perf_counter(); writer.write(output_frame); stats.stage_timers["write"] += perf_counter() - t
 
             stats.frame_times.append(perf_counter() - f0)
             fps_tracker.append(perf_counter() - f0)
             
-            prev_reuse_count = components["scheduler"].stat_reuse
+            prev_reuse_count, prev_real_count = components["scheduler"].stat_reuse
             prev_real_count = components["scheduler"].stat_real
 
             frame_idx += 1
@@ -336,6 +364,7 @@ def run_processing_loop(cfg: Config, cap: cv2.VideoCapture, writer: cv2.VideoWri
 
 
 def print_summary(cfg: Config, stats: Stats, meta: dict, wall_time: float, device: str, sched: EmbeddingScheduler):
+    # This function remains correct as is.
     frames = len(stats.frame_times)
     if frames == 0: print("No frames were processed."); return
     total_time_s, mean_ms = sum(stats.frame_times), 1000 * sum(stats.frame_times) / frames
@@ -359,14 +388,19 @@ def main():
     cfg = parse_and_merge_config()
     device = "cpu" if cfg.system.cpu else ("cuda" if torch.cuda.is_available() else "cpu")
     if cfg.io.source is None: raise ValueError("Input video --source is required.")
+    
     hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
     if hf_token: login(token=hf_token, add_to_git_credential=False); print("💡 Hugging Face token found and used for programmatic login.")
+    
     video_meta, interrupted, components = {}, False, {}
     try:
-        cap, writer = setup_video_io(cfg.io, video_meta)
+        # --- UPDATED: Pass visualization config to setup function ---
+        cap, writer = setup_video_io(cfg.io, cfg.viz, video_meta)
+        
         end_frame = cfg.io.end_frame if cfg.io.end_frame is not None else video_meta["total_frames"]
         frames_to_process = end_frame - cfg.io.start_frame
         if frames_to_process <= 0: raise ValueError("End frame must be greater than start frame.")
+        
         components, t_start = initialize_components(cfg, device), perf_counter()
         stats = run_processing_loop(cfg, cap, writer, components, frames_to_process, device)
         wall_time = perf_counter() - t_start
@@ -377,6 +411,7 @@ def main():
         if 'cap' in locals(): cap.release()
         if 'writer' in locals(): writer.release()
         cv2.destroyAllWindows()
+        
     if interrupted: print("\n^C received — stopping gracefully. Partial output saved.")
     if 'stats' in locals() and 'wall_time' in locals() and stats.frame_times:
         print_summary(cfg, stats, video_meta, wall_time, device, components["scheduler"])
@@ -388,4 +423,3 @@ if __name__ == "__main__":
     except Exception as e:
         if "--debug" in sys.argv or os.getenv("MOT_DEBUG") == "1": raise
         print(f"An unexpected error occurred: {e}", file=sys.stderr); sys.exit(1)
-

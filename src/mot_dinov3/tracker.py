@@ -1,4 +1,4 @@
-# src/mot_dinov3/tracker.py (Enhanced with Re-ID Events and Motion Heuristics)
+# src/mot_dinov3/tracker.py (Enhanced with Debug Info Capture)
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -32,9 +32,10 @@ class Track:
     last_conf: float = 0.0
     center: np.ndarray = field(init=False)
     velocity: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0]), repr=False)
-    # --- ENHANCED: Add position history for drawing trails ---
     center_history: deque = field(default_factory=lambda: deque(maxlen=25), repr=False)
-
+    
+    # --- NEW: Store image crop for visualization panels ---
+    last_known_crop: Optional[np.ndarray] = field(default=None, repr=False)
 
     def __post_init__(self):
         self.center = utils.centers_xyxy(self.box[np.newaxis, :])[0]
@@ -50,9 +51,7 @@ class Track:
         velocity = self.center - old_center
         self.velocity = 0.7 * self.velocity + 0.3 * velocity 
         
-        # --- ENHANCED: Append new position to the history ---
         self.center_history.append(self.center.astype(int))
-
         self.box = box.astype(np.float32)
 
         det_conf = float(np.clip(det_conf, 0.0, 1.0))
@@ -94,6 +93,13 @@ class Track:
             if sim > best: best = sim
         return best
 
+    # --- NEW & CORRECTED: Property to determine if a track is static ---
+    @property
+    def is_static(self) -> bool:
+        """Returns True if the track's velocity is below a threshold."""
+        # This threshold may need tuning based on your video's resolution and frame rate.
+        STATIC_VELOCITY_THRESHOLD = 1.5 
+        return np.linalg.norm(self.velocity) < STATIC_VELOCITY_THRESHOLD
 
 class SimpleTracker:
     def __init__(self, **kwargs):
@@ -120,14 +126,21 @@ class SimpleTracker:
         self.class_decay_factor = kwargs.get('class_decay_factor', 0.05)
         self.motion_gate = kwargs.get('motion_gate', True)
         self.extrapolation_window = kwargs.get('extrapolation_window', 30)
+        # --- NEW: Parameter for Re-ID debug panel ---
+        self.reid_debug_k = kwargs.get('reid_debug_k', 3)
         
         self.tracks: List[Track] = []
         self._next_id = 1
         self.reid_events_this_frame: List[Dict] = []
+        # --- NEW: Dictionary to store debug info for visualization ---
+        self.reid_debug_info: Dict = {}
 
-    def _new_track(self, box: np.ndarray, emb: np.ndarray, cls: Optional[int]) -> Track:
+    # --- UPDATED: Method signature changed to accept 'frame' ---
+    def _new_track(self, box: np.ndarray, emb: np.ndarray, cls: Optional[int], frame: np.ndarray) -> Track:
         t = Track(tid=self._next_id, box=box, emb=emb, cls=cls if (cls is not None and cls >= 0) else None,
                   alpha=self.ema_alpha, gallery_max=self.gallery_size)
+        # --- NEW: Store the initial image crop ---
+        t.last_known_crop = utils.get_crop(frame, box)
         if t.cls is not None: t.cls_hist[t.cls] = 1.0
         self._next_id += 1
         self.tracks.append(t)
@@ -146,9 +159,10 @@ class SimpleTracker:
         penalty_mask = np.logical_and(is_valid_track, is_mismatched)
         return C + self.class_penalty * penalty_mask.astype(np.float32)
 
+    # --- UPDATED: Method signature changed to accept 'frame' ---
     def _associate(self, cost_matrix: np.ndarray, unmatched_dets: Set[int], unmatched_tracks: Set[int],
                    act_idx: List[int], det_ids: List[int], boxes: np.ndarray, embs: np.ndarray,
-                   clses: Optional[np.ndarray], confs: Optional[np.ndarray], is_reid: bool = False):
+                   frame: np.ndarray, clses: Optional[np.ndarray], confs: Optional[np.ndarray], is_reid: bool = False):
         if self.use_hungarian: rows, cols = linear_sum_assignment(cost_matrix)
         else:
             rows, cols, used_r, used_c = [], [], set(), set()
@@ -169,54 +183,73 @@ class SimpleTracker:
             track.update(boxes[j], embs[j], det_conf=(confs[j] if confs is not None else 1.0), det_cls=(int(clses[j]) if clses is not None else None),
                          conf_min_update=self.conf_min_update, conf_update_weight=self.conf_update_weight,
                          class_vote_smoothing=self.class_vote_smoothing, class_decay_factor=self.class_decay_factor)
+            # --- NEW: Update the track's image crop after a successful match ---
+            track.last_known_crop = utils.get_crop(frame, boxes[j])
+            
             unmatched_dets.discard(j)
             unmatched_tracks.discard(ti)
 
-    def update(self, det_boxes: np.ndarray, det_embs: np.ndarray,
-               confs: Optional[np.ndarray] = None, clses: Optional[np.ndarray] = None) -> Tuple[List[Track], List[Dict]]:
+    # --- UPDATED: Method signature changed to accept 'frame' and return 'reid_debug_info' ---
+    def update(self, det_boxes: np.ndarray, det_embs: np.ndarray, frame: np.ndarray,
+               confs: Optional[np.ndarray] = None, clses: Optional[np.ndarray] = None) -> Tuple[List[Track], List[Dict], Dict]:
         self.reid_events_this_frame.clear()
+        self.reid_debug_info.clear() # Clear debug info each frame
         N = len(det_boxes)
+
         # --- Stage 1: Associate ACTIVE tracks ---
         if confs is not None:
             hi_ids, lo_ids = [i for i, c in enumerate(confs) if c >= self.conf_high], [i for i, c in enumerate(confs) if self.conf_low <= c < self.conf_high]
         else: hi_ids, lo_ids = list(range(N)), []
         act_idx = [i for i, t in enumerate(self.tracks) if t.state == "active"]
         unmatched_tracks = set(act_idx)
-        unmatched_hi, unmatched_tracks = self._match_active(list(unmatched_tracks), hi_ids, det_boxes, det_embs, clses, confs, use_iou_only=False)
-        unmatched_lo, unmatched_tracks = self._match_active(list(unmatched_tracks), lo_ids, det_boxes, det_embs, clses, confs, use_iou_only=self.low_conf_iou_only)
+        # --- UPDATED: Pass 'frame' to matching functions ---
+        unmatched_hi, unmatched_tracks = self._match_active(list(unmatched_tracks), hi_ids, det_boxes, det_embs, frame, clses, confs, use_iou_only=False)
+        unmatched_lo, unmatched_tracks = self._match_active(list(unmatched_tracks), lo_ids, det_boxes, det_embs, frame, clses, confs, use_iou_only=self.low_conf_iou_only)
         for ti in unmatched_tracks: self.tracks[ti].mark_lost()
         
-        # --- Stage 2: Re-ID LOST tracks ---
+        # --- Stage 2: Re-ID LOST tracks (now passes 'frame') ---
         unmatched_dets = unmatched_hi.union(unmatched_lo)
-        self._reid_lost(unmatched_dets, det_boxes, det_embs, clses, confs)
+        self._reid_lost(unmatched_dets, det_boxes, det_embs, frame, clses, confs)
 
-        # --- Stage 3: Create new tracks ---
+        # --- Stage 3: Create new tracks (now passes 'frame') ---
         for j in sorted(list(unmatched_dets)):
             cls = int(clses[j]) if clses is not None else None
-            self._new_track(det_boxes[j], det_embs[j], cls)
+            self._new_track(det_boxes[j], det_embs[j], cls, frame)
+            
         self._prune_removed()
-        return self.tracks, self.reid_events_this_frame
+        return self.tracks, self.reid_events_this_frame, self.reid_debug_info
 
-    def _match_active(self, act_idx, det_ids, boxes, embs, clses, confs, use_iou_only=False):
+    # --- UPDATED: Method signature changed to accept 'frame' ---
+    def _match_active(self, act_idx: List[int], det_ids: List[int], boxes: np.ndarray, embs: np.ndarray, frame: np.ndarray, 
+                      clses: Optional[np.ndarray], confs: Optional[np.ndarray], use_iou_only: bool = False):
         unmatched_dets, unmatched_tracks = set(det_ids), set(act_idx)
         if not act_idx or not det_ids: return unmatched_dets, unmatched_tracks
+        
         track_boxes = np.stack([self.tracks[i].box for i in act_idx])
         cost_iou = 1.0 - utils.iou_matrix(track_boxes, boxes[det_ids])
+        
         if use_iou_only:
-            cost_matrix = cost_iou; cost_matrix[cost_iou > (1.0 - self.iou_thresh_low)] = 1e6
+            cost_matrix = cost_iou
+            cost_matrix[cost_iou > (1.0 - self.iou_thresh_low)] = 1e6
         else:
             track_embs = np.stack([self.tracks[i].emb for i in act_idx])
             cost_app = utils.cosine_cost_matrix(track_embs, embs[det_ids])
             cost_matrix = self.iou_w * cost_iou + self.app_w * cost_app
             cost_matrix[cost_iou > (1.0 - self.iou_thresh)] = 1e6
+            
         cost_matrix = self._add_soft_class_penalty(cost_matrix, act_idx, det_ids, clses)
-        self._associate(cost_matrix, unmatched_dets, unmatched_tracks, act_idx, det_ids, boxes, embs, clses, confs)
+        self._associate(cost_matrix, unmatched_dets, unmatched_tracks, act_idx, det_ids, boxes, embs, frame, clses, confs)
         return unmatched_dets, unmatched_tracks
 
-    def _reid_lost(self, unmatched_dets: Set[int], boxes: np.ndarray, embs: np.ndarray,
+    # --- UPDATED: Method signature changed to accept 'frame' and capture debug info ---
+    def _reid_lost(self, unmatched_dets: Set[int], boxes: np.ndarray, embs: np.ndarray, frame: np.ndarray,
                    clses: Optional[np.ndarray], confs: Optional[np.ndarray]):
+        if not unmatched_dets: return
+        
         # --- ENHANCED: Split lost tracks into two groups for staged search ---
         lost_idx = [i for i, t in enumerate(self.tracks) if t.state == "lost"]
+        if not lost_idx: return
+        
         lost_tracks_all = [self.tracks[i] for i in lost_idx]
         lost_gated_idx = [i for i, t in zip(lost_idx, lost_tracks_all) if t.time_since_update <= self.extrapolation_window]
         lost_global_idx = [i for i, t in zip(lost_idx, lost_tracks_all) if t.time_since_update > self.extrapolation_window]
@@ -224,28 +257,57 @@ class SimpleTracker:
         # --- Phase 2a: Gated Re-ID for recently lost tracks ---
         det_left_ids = sorted(list(unmatched_dets))
         if lost_gated_idx and det_left_ids:
-            lost_tracks = [self.tracks[i] for i in lost_gated_idx]
-            det_boxes, det_embs = boxes[det_left_ids], embs[det_left_ids]
-            cost_app = utils.cosine_cost_matrix(np.stack([t.emb for t in lost_tracks]), det_embs)
-            cost_matrix = cost_app.copy()
-            cost_matrix[cost_app > (1.0 - self.reid_sim_thresh)] = 1e6
-            if self.motion_gate:
-                time_since = np.array([t.time_since_update for t in lost_tracks])
-                pred_centers = np.stack([t.center for t in lost_tracks]) + np.stack([t.velocity for t in lost_tracks]) * time_since[:, np.newaxis]
-                det_centers = utils.centers_xyxy(det_boxes)
-                dist = np.linalg.norm(pred_centers[:, np.newaxis, :] - det_centers[np.newaxis, :, :], axis=2)
-                allowance = self.center_gate_base + self.center_gate_slope * time_since
-                cost_matrix[dist > allowance[:, np.newaxis]] = 1e6
-            unmatched_lost_gated = set(range(len(lost_gated_idx)))
-            self._associate(cost_matrix, unmatched_dets, unmatched_lost_gated, lost_gated_idx, det_left_ids, boxes, embs, clses, confs, is_reid=True)
-        
+            self._process_reid_group(lost_gated_idx, det_left_ids, unmatched_dets, boxes, embs, frame, clses, confs, use_motion_gating=True)
+
         # --- Phase 2b: Global Re-ID for long-lost tracks ---
         det_left_ids = sorted(list(unmatched_dets))
         if lost_global_idx and det_left_ids:
-            lost_tracks = [self.tracks[i] for i in lost_global_idx]
-            det_embs = embs[det_left_ids]
-            cost_app = utils.cosine_cost_matrix(np.stack([t.emb for t in lost_tracks]), det_embs)
-            cost_matrix = cost_app.copy()
-            cost_matrix[cost_app > (1.0 - self.reid_sim_thresh)] = 1e6
-            unmatched_lost_global = set(range(len(lost_global_idx)))
-            self._associate(cost_matrix, unmatched_dets, unmatched_lost_global, lost_global_idx, det_left_ids, boxes, embs, clses, confs, is_reid=True)
+            self._process_reid_group(lost_global_idx, det_left_ids, unmatched_dets, boxes, embs, frame, clses, confs, use_motion_gating=False)
+
+    # --- NEW: Helper function to process a group of lost tracks for Re-ID ---
+    def _process_reid_group(self, lost_idx_group: List[int], det_ids: List[int], unmatched_dets: Set[int],
+                            boxes: np.ndarray, embs: np.ndarray, frame: np.ndarray, clses: Optional[np.ndarray],
+                            confs: Optional[np.ndarray], use_motion_gating: bool):
+        
+        lost_tracks = [self.tracks[i] for i in lost_idx_group]
+        det_embs_subset = embs[det_ids]
+        cost_app = utils.cosine_cost_matrix(np.stack([t.emb for t in lost_tracks]), det_embs_subset)
+        
+        # --- NEW: Capture Re-ID candidates for debug visualization ---
+        if self.reid_debug_k > 0:
+            for i, track in enumerate(lost_tracks):
+                if track.tid in self.reid_debug_info: continue
+                sim_scores = 1.0 - cost_app[i, :]
+                top_k_indices = np.argsort(sim_scores)[::-1][:self.reid_debug_k]
+                
+                candidates = []
+                for det_idx_in_subset in top_k_indices:
+                    if sim_scores[det_idx_in_subset] < self.reid_sim_thresh * 0.5: continue
+                    
+                    original_det_idx = det_ids[det_idx_in_subset]
+                    candidate_box = boxes[original_det_idx]
+                    candidates.append({
+                        'box': candidate_box, 
+                        'score': sim_scores[det_idx_in_subset],
+                        'crop': utils.get_crop(frame, candidate_box)
+                    })
+                
+                if candidates:
+                    self.reid_debug_info[track.tid] = {
+                        'query_crop': track.last_known_crop,
+                        'candidates': candidates
+                    }
+
+        cost_matrix = cost_app.copy()
+        cost_matrix[cost_app > (1.0 - self.reid_sim_thresh)] = 1e6
+        
+        if use_motion_gating and self.motion_gate:
+            time_since = np.array([t.time_since_update for t in lost_tracks])
+            pred_centers = np.stack([t.center for t in lost_tracks]) + np.stack([t.velocity for t in lost_tracks]) * time_since[:, np.newaxis]
+            det_centers = utils.centers_xyxy(boxes[det_ids])
+            dist = np.linalg.norm(pred_centers[:, np.newaxis, :] - det_centers[np.newaxis, :, :], axis=2)
+            allowance = self.center_gate_base + self.center_gate_slope * time_since
+            cost_matrix[dist > allowance[:, np.newaxis]] = 1e6
+
+        unmatched_lost = set(range(len(lost_idx_group)))
+        self._associate(cost_matrix, unmatched_dets, unmatched_lost, lost_idx_group, det_ids, boxes, embs, frame, clses, confs, is_reid=True)
