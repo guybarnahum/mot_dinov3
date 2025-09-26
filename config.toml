@@ -56,12 +56,15 @@ extrapolation_window = 180
 # --- End of Re-ID Heuristics ---
 
 [viz]
+# --- Master switch for the advanced debug view ---
+debug_panels = true   # Set to true to enable the panels
+
 # --- Enable all advanced visualizations ---
 viz_reasons = true    # Show scheduler reasons on bbox labels
 viz_hud = true        # Show the real-time statistics HUD
 viz_reid = true       # Show enhanced Re-ID event links
-viz_trails = true     # Show a short, fading path for each active track
-viz_prediction = true # Show a predicted motion vector for lost tracks
+# Note: Trails and Predictions are now part of the main `draw_tracks` function
+# and will be shown in debug_panels mode automatically.
 
 # Show lost tracks as dashed boxes so you can see what the tracker is trying to find.
 draw_lost = true
