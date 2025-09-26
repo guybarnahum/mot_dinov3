@@ -63,8 +63,6 @@ debug_panels = true   # Set to true to enable the panels
 viz_reasons = true    # Show scheduler reasons on bbox labels
 viz_hud = true        # Show the real-time statistics HUD
 viz_reid = true       # Show enhanced Re-ID event links
-# Note: Trails and Predictions are now part of the main `draw_tracks` function
-# and will be shown in debug_panels mode automatically.
 
 # Show lost tracks as dashed boxes so you can see what the tracker is trying to find.
 draw_lost = true
