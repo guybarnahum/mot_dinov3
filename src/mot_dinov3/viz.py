@@ -1,4 +1,4 @@
-# src/mot_dinov3/viz.py (Enhanced with Debug Panels)
+# src/mot_dinov3/viz.py (Enhanced with Legend and Larger Panels)
 from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
@@ -32,7 +32,7 @@ def _id_to_color(tid: int, desaturate: bool = False) -> Tuple[int, int, int]:
 
 def _state_to_color(track) -> Tuple[int, int, int]:
     """Returns a BGR color based on the track's state."""
-    RECENT_LOSS_THRESHOLD = 30  # Should align with tracker's extrapolation_window
+    RECENT_LOSS_THRESHOLD = 30
     if track.state == "active":
         return (200, 120, 0) if track.is_static else (0, 200, 50)  # Blue for Static, Green for Dynamic
     elif track.state == "lost":
@@ -40,7 +40,7 @@ def _state_to_color(track) -> Tuple[int, int, int]:
             return (0, 165, 255)  # Orange for Recently Lost
         else:
             return (0, 0, 220)  # Red for Long-Term Lost
-    return (255, 255, 255) # White for any other state
+    return (255, 255, 255)
 
 # ---------- Drawing helpers ----------
 
@@ -73,51 +73,52 @@ def _resize_crop(crop: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
     canvas[y_offset:y_offset + new_h, x_offset:x_offset + new_w] = resized
     return canvas
 
-# ---------- Panel Drawing Functions ----------
+# ---------- Panel and Legend Drawing Functions ----------
 
 def _draw_lost_panel(canvas: np.ndarray, tracks: list, y_start: int, panel_h: int):
     """Draws the 'Hall of the Lost' panel for long-lost tracks."""
     cv2.rectangle(canvas, (0, y_start), (canvas.shape[1], y_start + panel_h), (20, 20, 20), -1)
-    _draw_label(canvas, "Long-Term Lost Tracks", (10, y_start + 20), (150, 150, 150))
+    _draw_label(canvas, "Long-Term Lost Tracks", (10, y_start + 25), (150, 150, 150), font_scale=0.6)
     
     RECENT_LOSS_THRESHOLD = 30
     long_lost_tracks = [t for t in tracks if t.state == "lost" and t.time_since_update > RECENT_LOSS_THRESHOLD]
     
-    thumb_w, thumb_h = 80, 80
+    # --- MODIFIED: Increased thumbnail size for better visibility ---
+    thumb_w, thumb_h = 120, 120
     x_offset = 10
     
     for t in long_lost_tracks:
         if t.last_known_crop is None: continue
         thumbnail = _resize_crop(t.last_known_crop, (thumb_w, thumb_h))
         
-        y_pos = y_start + 30
+        y_pos = y_start + 40
         canvas[y_pos:y_pos + thumb_h, x_offset:x_offset + thumb_w] = thumbnail
         
         label = f"ID {t.tid} ({t.time_since_update}f)"
-        _draw_label(canvas, label, (x_offset, y_pos + thumb_h + 15), _state_to_color(t))
+        _draw_label(canvas, label, (x_offset, y_pos + thumb_h + 20), _state_to_color(t))
         x_offset += thumb_w + 10
         if x_offset + thumb_w > canvas.shape[1]: break
 
 def _draw_reid_debug_panel(canvas: np.ndarray, reid_debug_info: dict, y_start: int, panel_h: int):
     """Draws the Re-ID candidate comparison panel."""
     cv2.rectangle(canvas, (0, y_start), (canvas.shape[1], y_start + panel_h), (20, 20, 20), -1)
-    _draw_label(canvas, "Re-ID Candidate Matching", (10, y_start + 20), (150, 150, 150))
+    _draw_label(canvas, "Re-ID Candidate Matching", (10, y_start + 25), (150, 150, 150), font_scale=0.6)
 
     if not reid_debug_info: return
 
-    # Visualize the first lost track in the debug info
     query_tid = next(iter(reid_debug_info))
     info = reid_debug_info[query_tid]
     
-    thumb_w, thumb_h = 80, 80
+    # --- MODIFIED: Increased thumbnail size for better visibility ---
+    thumb_w, thumb_h = 120, 120
     x_offset = 10
-    y_pos = y_start + 30
+    y_pos = y_start + 40
     
     # Draw Query
     if info['query_crop'] is not None:
         query_thumb = _resize_crop(info['query_crop'], (thumb_w, thumb_h))
         canvas[y_pos:y_pos + thumb_h, x_offset:x_offset + thumb_w] = query_thumb
-        _draw_label(canvas, f"Query ID {query_tid}", (x_offset, y_pos + thumb_h + 15), (255, 255, 0))
+        _draw_label(canvas, f"Query ID {query_tid}", (x_offset, y_pos + thumb_h + 20), (255, 255, 0))
     
     x_offset += thumb_w + 20
     cv2.line(canvas, (x_offset, y_pos), (x_offset, y_pos + thumb_h), (100, 100, 100), 2)
@@ -127,12 +128,35 @@ def _draw_reid_debug_panel(canvas: np.ndarray, reid_debug_info: dict, y_start: i
     for cand in info['candidates']:
         cand_thumb = _resize_crop(cand['crop'], (thumb_w, thumb_h))
         canvas[y_pos:y_pos + thumb_h, x_offset:x_offset + thumb_w] = cand_thumb
-        
         score = cand['score']
-        color = (0, 255, 0) if score > 0.6 else (0, 215, 255) # Green for high score, Yellow for low
-        _draw_label(canvas, f"Score: {score:.2f}", (x_offset, y_pos + thumb_h + 15), color)
+        color = (0, 255, 0) if score > 0.6 else (0, 215, 255)
+        _draw_label(canvas, f"Score: {score:.2f}", (x_offset, y_pos + thumb_h + 20), color)
         x_offset += thumb_w + 10
         if x_offset + thumb_w > canvas.shape[1]: break
+
+# --- NEW: Function to draw the color and shape legend ---
+def draw_legend(frame: np.ndarray):
+    """Draws a legend for track colors and shapes in the top-right corner."""
+    legend_items = {
+        "Dynamic": (0, 200, 50),
+        "Static": (200, 120, 0),
+        "Recent Loss": (0, 165, 255),
+        "Search Area": (0, 165, 255),
+    }
+    x, y, line_h, pad = frame.shape[1] - 180, 20, 22, 5
+    
+    overlay = frame.copy()
+    cv2.rectangle(overlay, (x - pad, y - pad), (x + 150 + pad, y + len(legend_items) * line_h), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+
+    for i, (label, color) in enumerate(legend_items.items()):
+        y_pos = y + i * line_h
+        if label == "Search Area":
+            cv2.circle(frame, (x + 10, y_pos + 7), 8, color, 1, cv2.LINE_AA)
+        else:
+            cv2.rectangle(frame, (x, y_pos), (x + 20, y_pos + 15), color, -1)
+        
+        cv2.putText(frame, label, (x + 30, y_pos + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
 # ---------- Public API ----------
 
@@ -145,33 +169,26 @@ def draw_tracks(frame: np.ndarray, tracks: list, tracker_config: dict):
         color = _state_to_color(t)
         x1, y1, x2, y2 = np.clip(t.box, [0, 0, 0, 0], [W - 1, H - 1, W - 1, H - 1]).astype(int)
         
-        # Draw Trail
         if t.state == "active" and len(t.center_history) > 1:
             points = np.array(list(t.center_history), dtype=np.int32).reshape((-1, 1, 2))
             cv2.polylines(frame, [points], isClosed=False, color=color, thickness=2, lineType=cv2.LINE_AA)
         
-        # Draw Box and Search Area
         if t.state == "lost" and t.time_since_update <= RECENT_LOSS_THRESHOLD:
-            # Draw predicted search area for recently lost tracks
             pred_center = (t.center + t.velocity * t.time_since_update).astype(int)
             allowance = tracker_config.get('center_gate_base', 50.0) + \
                         tracker_config.get('center_gate_slope', 10.0) * t.time_since_update
             cv2.circle(frame, tuple(pred_center), int(allowance), color, 1, cv2.LINE_AA)
             cv2.line(frame, tuple(t.center.astype(int)), tuple(pred_center), color, 1, cv2.LINE_AA)
         
-        # Draw bounding box for active tracks
         if t.state == "active":
              cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
-
-        label = f"ID {t.tid}"
-        _draw_label(frame, label, (x1, y1), color)
+        _draw_label(frame, f"ID {t.tid}", (x1, y1), color)
 
 def draw_hud(frame: np.ndarray, stats: Dict):
     """Draws a Heads-Up Display with system statistics."""
     font, font_scale, thickness, color = cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1, (255, 255, 255)
     x, y, line_h = 10, 20, 18
     
-    # Create a semi-transparent background for the HUD
     overlay = frame.copy()
     cv2.rectangle(overlay, (0, 0), (220, 120), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
@@ -194,9 +211,8 @@ def draw_hud(frame: np.ndarray, stats: Dict):
         draw_text("  Active", stats['Tracker'].get('Active', 'N/A'))
         draw_text("  Lost", stats['Tracker'].get('Lost', 'N/A'))
 
-
 def draw_reid_links(frame: np.ndarray, reid_events: List[Dict], tracks: list):
-    """Draws visual links for Re-ID events, now using state-based color."""
+    """Draws visual links for Re-ID events, using state-based color."""
     tid_to_track = {t.tid: t for t in tracks}
     for event in reid_events:
         tid = int(event['tid'])
@@ -212,41 +228,35 @@ def draw_reid_links(frame: np.ndarray, reid_events: List[Dict], tracks: list):
         cv2.circle(frame, c_new, 6, color, -1, cv2.LINE_AA)
         _draw_label(frame, f"Re-ID: {event['score']:.2f}", c_new, color)
 
-
-# In src/mot_dinov3/viz.py
-
 def create_enhanced_frame(
     frame: np.ndarray, 
     tracks: list,
     reid_events: List[Dict],
     reid_debug_info: dict,
     tracker_config: dict,
-    hud_stats: dict  
+    hud_stats: dict
 ) -> np.ndarray:
-    """
-    Creates a single large frame with the main view and debug panels.
-    This is the new primary function to call for visualization.
-    """
+    """Creates a single large frame with the main view and debug panels."""
     frame_h, frame_w = frame.shape[:2]
-    panel_h = 150
+    # --- MODIFIED: Increased panel height for larger thumbnails ---
+    panel_h = 200
 
     canvas = np.zeros((frame_h + panel_h * 2, frame_w, 3), dtype=np.uint8)
     canvas[:frame_h, :, :] = frame
     
-    # 1. Draw main tracks, search areas, and re-id links
     draw_tracks(canvas, tracks, tracker_config)
     draw_reid_links(canvas, reid_events, tracks)
 
-    # 2. Draw the "Hall of the Lost" panel
     lost_panel_y_start = frame_h
     _draw_lost_panel(canvas, tracks, lost_panel_y_start, panel_h)
 
-    # 3. Draw the Re-ID Debug panel
     reid_panel_y_start = frame_h + panel_h
     _draw_reid_debug_panel(canvas, reid_debug_info, reid_panel_y_start, panel_h)
     
-    # 4. Draw the HUD on top of the final canvas
-    if hud_stats: 
+    # --- NEW: Draw the legend on the final canvas ---
+    draw_legend(canvas)
+
+    if hud_stats:
         draw_hud(canvas, hud_stats)
 
     return canvas
