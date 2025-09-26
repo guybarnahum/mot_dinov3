@@ -1,4 +1,4 @@
-# src/mot_dinov3/viz.py (Enhanced with Legend and Larger Panels)
+# src/mot_dinov3/viz.py (Enhanced with Arrows from Lost Panel)
 from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
@@ -6,31 +6,11 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
+# --- Public constants for easy tuning of the debug view ---
 DEBUG_PANEL_HEIGHT = 200
+DEBUG_THUMBNAIL_SIZE = (120, 120)
 
 # ---------- Color helpers ----------
-
-def _hsv_to_rgb(h: float, s: float, v: float) -> Tuple[float, float, float]:
-    """h,s,v in [0,1] -> r,g,b in [0,1]"""
-    i = int(h * 6.0)
-    f = h * 6.0 - i
-    p, q, t = v * (1.0 - s), v * (1.0 - f * s), v * (1.0 - (1.0 - f) * s)
-    i %= 6
-    if i == 0: r, g, b = v, t, p
-    elif i == 1: r, g, b = q, v, p
-    elif i == 2: r, g, b = p, v, t
-    elif i == 3: r, g, b = p, q, v
-    elif i == 4: r, g, b = t, p, v
-    else: r, g, b = v, p, q
-    return r, g, b
-
-def _id_to_color(tid: int, desaturate: bool = False) -> Tuple[int, int, int]:
-    """Fallback deterministic color from an integer track id. Returns BGR."""
-    phi = 0.618033988749895
-    h = (tid * phi) % 1.0
-    s, v = (0.4, 0.95) if desaturate else (0.9, 1.0)
-    r, g, b = _hsv_to_rgb(h, s, v)
-    return int(b * 255), int(g * 255), int(r * 255)
 
 def _state_to_color(track) -> Tuple[int, int, int]:
     """Returns a BGR color based on the track's state."""
@@ -49,13 +29,18 @@ def _state_to_color(track) -> Tuple[int, int, int]:
 def _draw_label(img: np.ndarray, text: str, pos: Tuple[int, int], color: Tuple[int, int, int],
                 font_scale: float = 0.5, thickness: int = 1,
                 bg_color: Optional[Tuple[int, int, int]] = None) -> None:
+    """Draw a filled label box with auto-contrasting text."""
     font = cv2.FONT_HERSHEY_SIMPLEX
     (tw, th), baseline = cv2.getTextSize(text, font, font_scale, thickness)
     x, y = pos
     pad = 3
     bg_color = bg_color if bg_color is not None else color
+    
+    luminance = 0.299 * bg_color[2] + 0.587 * bg_color[1] + 0.114 * bg_color[0]
+    text_color = (0, 0, 0) if luminance > 128 else (255, 255, 255)
+
     cv2.rectangle(img, (x, y - th - 2 * pad), (x + tw + 2 * pad, y), bg_color, -1)
-    cv2.putText(img, text, (x + pad, y - pad), font, font_scale, (255, 255, 255), thickness, cv2.LINE_AA)
+    cv2.putText(img, text, (x + pad, y - pad), font, font_scale, text_color, thickness, cv2.LINE_AA)
 
 def _resize_crop(crop: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
     """Resizes a crop to a target size, preserving aspect ratio by padding."""
@@ -85,8 +70,7 @@ def _draw_lost_panel(canvas: np.ndarray, tracks: list, y_start: int, panel_h: in
     RECENT_LOSS_THRESHOLD = 30
     long_lost_tracks = [t for t in tracks if t.state == "lost" and t.time_since_update > RECENT_LOSS_THRESHOLD]
     
-    # --- MODIFIED: Increased thumbnail size for better visibility ---
-    thumb_w, thumb_h = 120, 120
+    thumb_w, thumb_h = DEBUG_THUMBNAIL_SIZE
     x_offset = 10
     
     for t in long_lost_tracks:
@@ -96,8 +80,15 @@ def _draw_lost_panel(canvas: np.ndarray, tracks: list, y_start: int, panel_h: in
         y_pos = y_start + 40
         canvas[y_pos:y_pos + thumb_h, x_offset:x_offset + thumb_w] = thumbnail
         
+        color = _state_to_color(t)
         label = f"ID {t.tid} ({t.time_since_update}f)"
-        _draw_label(canvas, label, (x_offset, y_pos + thumb_h + 20), _state_to_color(t))
+        _draw_label(canvas, label, (x_offset, y_pos + thumb_h + 20), color)
+        
+        # --- NEW: Draw an arrow from the thumbnail to the last known position ---
+        arrow_start_pt = (x_offset + thumb_w // 2, y_pos + thumb_h // 2)
+        arrow_end_pt = tuple(t.center.astype(int))
+        cv2.arrowedLine(canvas, arrow_start_pt, arrow_end_pt, color, 2, tipLength=0.2)
+        
         x_offset += thumb_w + 10
         if x_offset + thumb_w > canvas.shape[1]: break
 
@@ -111,12 +102,10 @@ def _draw_reid_debug_panel(canvas: np.ndarray, reid_debug_info: dict, y_start: i
     query_tid = next(iter(reid_debug_info))
     info = reid_debug_info[query_tid]
     
-    # --- MODIFIED: Increased thumbnail size for better visibility ---
-    thumb_w, thumb_h = 120, 120
+    thumb_w, thumb_h = DEBUG_THUMBNAIL_SIZE
     x_offset = 10
     y_pos = y_start + 40
     
-    # Draw Query
     if info['query_crop'] is not None:
         query_thumb = _resize_crop(info['query_crop'], (thumb_w, thumb_h))
         canvas[y_pos:y_pos + thumb_h, x_offset:x_offset + thumb_w] = query_thumb
@@ -126,7 +115,6 @@ def _draw_reid_debug_panel(canvas: np.ndarray, reid_debug_info: dict, y_start: i
     cv2.line(canvas, (x_offset, y_pos), (x_offset, y_pos + thumb_h), (100, 100, 100), 2)
     x_offset += 10
 
-    # Draw Candidates
     for cand in info['candidates']:
         cand_thumb = _resize_crop(cand['crop'], (thumb_w, thumb_h))
         canvas[y_pos:y_pos + thumb_h, x_offset:x_offset + thumb_w] = cand_thumb
@@ -136,7 +124,6 @@ def _draw_reid_debug_panel(canvas: np.ndarray, reid_debug_info: dict, y_start: i
         x_offset += thumb_w + 10
         if x_offset + thumb_w > canvas.shape[1]: break
 
-# --- NEW: Function to draw the color and shape legend ---
 def draw_legend(frame: np.ndarray):
     """Draws a legend for track colors and shapes in the top-right corner."""
     legend_items = {
@@ -219,7 +206,7 @@ def draw_reid_links(frame: np.ndarray, reid_events: List[Dict], tracks: list):
     for event in reid_events:
         tid = int(event['tid'])
         track = tid_to_track.get(tid)
-        color = _state_to_color(track) if track else _id_to_color(tid)
+        color = _state_to_color(track) if track else (200,200,200)
 
         new_box, old_box = event['new_box'].astype(int), event['old_box'].astype(int)
         c_new = (int(new_box[0] + new_box[2]) // 2, int(new_box[1] + new_box[3]) // 2)
@@ -254,7 +241,6 @@ def create_enhanced_frame(
     reid_panel_y_start = frame_h + panel_h
     _draw_reid_debug_panel(canvas, reid_debug_info, reid_panel_y_start, panel_h)
     
-    # --- NEW: Draw the legend on the final canvas ---
     draw_legend(canvas)
 
     if hud_stats:
