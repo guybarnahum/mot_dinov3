@@ -9,6 +9,7 @@ import numpy as np
 # --- Public constants for easy tuning of the debug view ---
 DEBUG_PANEL_HEIGHT = 200
 DEBUG_THUMBNAIL_SIZE = (120, 120)
+ARROW_TIP_PIXELS = 15
 
 # ---------- Color helpers ----------
 
@@ -25,6 +26,19 @@ def _state_to_color(track) -> Tuple[int, int, int]:
     return (255, 255, 255)
 
 # ---------- Drawing helpers ----------
+def _draw_arrow(canvas: np.ndarray, pt1: Tuple[int, int], pt2: Tuple[int, int], color: Tuple[int, int, int], 
+                thickness: int = 2, absolute_tip_pixels: int = ARROW_TIP_PIXELS):
+    """Draws an arrow with an arrowhead of a constant pixel size."""
+    # Calculate the total length of the arrow
+    arrow_length = np.linalg.norm(np.array(pt2) - np.array(pt1))
+    
+    # Prevent division by zero and only draw if the line has length
+    if arrow_length > 0:
+        # Calculate the relative tip length
+        relative_tip_length = absolute_tip_pixels / arrow_length
+        cv2.arrowedLine(canvas, pt1, pt2, color, thickness, 
+                        line_type=cv2.LINE_AA, tipLength=relative_tip_length)
+
 
 def _draw_label(img: np.ndarray, text: str, pos: Tuple[int, int], color: Tuple[int, int, int],
                 font_scale: float = 0.5, thickness: int = 1,
@@ -41,6 +55,7 @@ def _draw_label(img: np.ndarray, text: str, pos: Tuple[int, int], color: Tuple[i
 
     cv2.rectangle(img, (x, y - th - 2 * pad), (x + tw + 2 * pad, y), bg_color, -1)
     cv2.putText(img, text, (x + pad, y - pad), font, font_scale, text_color, thickness, cv2.LINE_AA)
+
 
 def _resize_crop(crop: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
     """Resizes a crop to a target size, preserving aspect ratio by padding."""
@@ -62,7 +77,6 @@ def _resize_crop(crop: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
 
 # ---------- Panel and Legend Drawing Functions ----------
 
-# --- NEW: Helper function to draw a list of tracks in a given area ---
 def _draw_track_list_in_panel(canvas: np.ndarray, tracks_to_draw: list, title: str,
                               x_start: int, x_end: int, y_start: int, is_recent_loss: bool):
     """A generic helper to draw a titled list of track thumbnails in a panel section."""
@@ -74,7 +88,7 @@ def _draw_track_list_in_panel(canvas: np.ndarray, tracks_to_draw: list, title: s
     
     for t in tracks_to_draw:
         if t.last_known_crop is None: continue
-        if x_offset + thumb_w > x_end: break # Stop if we run out of space
+        if x_offset + thumb_w > x_end: break
         
         thumbnail = _resize_crop(t.last_known_crop, (thumb_w, thumb_h))
         canvas[y_pos:y_pos + thumb_h, x_offset:x_offset + thumb_w] = thumbnail
@@ -84,19 +98,19 @@ def _draw_track_list_in_panel(canvas: np.ndarray, tracks_to_draw: list, title: s
         _draw_label(canvas, label, (x_offset, y_pos + thumb_h + 20), color)
         
         arrow_start_pt = (x_offset + thumb_w // 2, y_pos + thumb_h // 2)
-        # Arrow points to predicted location for recent loss, last known for long-term loss
         if is_recent_loss:
             arrow_end_pt = tuple((t.center + t.velocity * t.time_since_update).astype(int))
         else:
             arrow_end_pt = tuple(t.center.astype(int))
         
-        cv2.arrowedLine(canvas, arrow_start_pt, arrow_end_pt, color, 2, tipLength=0.2)
+        # --- MODIFIED: Use the new helper function ---
+        _draw_arrow(canvas, arrow_start_pt, arrow_end_pt, color, absolute_tip_pixels=ARROW_TIP_PIXELS)
+        
         x_offset += thumb_w + 10
 
-# --- REFACTORED: This function is now much simpler ---
+
 def _draw_all_lost_tracks_panel(canvas: np.ndarray, tracks: list, y_start: int, panel_h: int):
     """Draws a panel with two sorted lists: recently lost and long-term lost tracks."""
-    # 1. Prepare the background and data
     cv2.rectangle(canvas, (0, y_start), (canvas.shape[1], y_start + panel_h), (20, 20, 20), -1)
     
     lost_tracks = sorted([t for t in tracks if t.state == "lost"], key=lambda t: t.time_since_update)
@@ -105,15 +119,14 @@ def _draw_all_lost_tracks_panel(canvas: np.ndarray, tracks: list, y_start: int, 
     recent_lost = [t for t in lost_tracks if t.time_since_update <= RECENT_LOSS_THRESHOLD]
     long_term_lost = [t for t in lost_tracks if t.time_since_update > RECENT_LOSS_THRESHOLD]
     
-    # 2. Define panel sections and draw the dividing line
     panel_midpoint = canvas.shape[1] // 2
     cv2.line(canvas, (panel_midpoint, y_start), (panel_midpoint, y_start + panel_h), (80, 80, 80), 1)
 
-    # 3. Call the helper function for each section
     _draw_track_list_in_panel(canvas, recent_lost, "Recently Lost (Gated Search)",
                               10, panel_midpoint, y_start, is_recent_loss=True)
     _draw_track_list_in_panel(canvas, long_term_lost, "Long-Term Lost (Global Search)",
                               panel_midpoint + 10, canvas.shape[1], y_start, is_recent_loss=False)
+
 
 def _draw_reid_debug_panel(canvas: np.ndarray, reid_debug_info: dict, y_start: int, panel_h: int):
     """Draws the Re-ID candidate comparison panel."""
