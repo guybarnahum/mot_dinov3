@@ -1,4 +1,4 @@
-# src/mot_dinov3/viz.py (Enhanced with Arrows from Lost Panel)
+# src/mot_dinov3/viz.py (Refactored with a Panel Drawing Helper)
 from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
@@ -7,8 +7,8 @@ import cv2
 import numpy as np
 
 # --- Public constants for easy tuning of the debug view ---
-DEBUG_PANEL_HEIGHT = 256
-DEBUG_THUMBNAIL_SIZE = (180, 180)
+DEBUG_PANEL_HEIGHT = 200
+DEBUG_THUMBNAIL_SIZE = (120, 120)
 
 # ---------- Color helpers ----------
 
@@ -62,35 +62,58 @@ def _resize_crop(crop: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
 
 # ---------- Panel and Legend Drawing Functions ----------
 
-def _draw_lost_panel(canvas: np.ndarray, tracks: list, y_start: int, panel_h: int):
-    """Draws the 'Hall of the Lost' panel for long-lost tracks."""
-    cv2.rectangle(canvas, (0, y_start), (canvas.shape[1], y_start + panel_h), (20, 20, 20), -1)
-    _draw_label(canvas, "Long-Term Lost Tracks", (10, y_start + 25), (150, 150, 150), font_scale=0.6)
-    
-    RECENT_LOSS_THRESHOLD = 30
-    long_lost_tracks = [t for t in tracks if t.state == "lost" and t.time_since_update > RECENT_LOSS_THRESHOLD]
+# --- NEW: Helper function to draw a list of tracks in a given area ---
+def _draw_track_list_in_panel(canvas: np.ndarray, tracks_to_draw: list, title: str,
+                              x_start: int, x_end: int, y_start: int, is_recent_loss: bool):
+    """A generic helper to draw a titled list of track thumbnails in a panel section."""
+    _draw_label(canvas, title, (x_start, y_start + 25), (150, 150, 150), font_scale=0.6)
     
     thumb_w, thumb_h = DEBUG_THUMBNAIL_SIZE
-    x_offset = 10
+    x_offset = x_start
+    y_pos = y_start + 40
     
-    for t in long_lost_tracks:
+    for t in tracks_to_draw:
         if t.last_known_crop is None: continue
-        thumbnail = _resize_crop(t.last_known_crop, (thumb_w, thumb_h))
+        if x_offset + thumb_w > x_end: break # Stop if we run out of space
         
-        y_pos = y_start + 40
+        thumbnail = _resize_crop(t.last_known_crop, (thumb_w, thumb_h))
         canvas[y_pos:y_pos + thumb_h, x_offset:x_offset + thumb_w] = thumbnail
         
         color = _state_to_color(t)
         label = f"ID {t.tid} ({t.time_since_update}f)"
         _draw_label(canvas, label, (x_offset, y_pos + thumb_h + 20), color)
         
-        # --- NEW: Draw an arrow from the thumbnail to the last known position ---
         arrow_start_pt = (x_offset + thumb_w // 2, y_pos + thumb_h // 2)
-        arrow_end_pt = tuple(t.center.astype(int))
-        cv2.arrowedLine(canvas, arrow_start_pt, arrow_end_pt, color, 2, tipLength=0.2)
+        # Arrow points to predicted location for recent loss, last known for long-term loss
+        if is_recent_loss:
+            arrow_end_pt = tuple((t.center + t.velocity * t.time_since_update).astype(int))
+        else:
+            arrow_end_pt = tuple(t.center.astype(int))
         
+        cv2.arrowedLine(canvas, arrow_start_pt, arrow_end_pt, color, 2, tipLength=0.2)
         x_offset += thumb_w + 10
-        if x_offset + thumb_w > canvas.shape[1]: break
+
+# --- REFACTORED: This function is now much simpler ---
+def _draw_all_lost_tracks_panel(canvas: np.ndarray, tracks: list, y_start: int, panel_h: int):
+    """Draws a panel with two sorted lists: recently lost and long-term lost tracks."""
+    # 1. Prepare the background and data
+    cv2.rectangle(canvas, (0, y_start), (canvas.shape[1], y_start + panel_h), (20, 20, 20), -1)
+    
+    lost_tracks = sorted([t for t in tracks if t.state == "lost"], key=lambda t: t.time_since_update)
+    RECENT_LOSS_THRESHOLD = 30
+    
+    recent_lost = [t for t in lost_tracks if t.time_since_update <= RECENT_LOSS_THRESHOLD]
+    long_term_lost = [t for t in lost_tracks if t.time_since_update > RECENT_LOSS_THRESHOLD]
+    
+    # 2. Define panel sections and draw the dividing line
+    panel_midpoint = canvas.shape[1] // 2
+    cv2.line(canvas, (panel_midpoint, y_start), (panel_midpoint, y_start + panel_h), (80, 80, 80), 1)
+
+    # 3. Call the helper function for each section
+    _draw_track_list_in_panel(canvas, recent_lost, "Recently Lost (Gated Search)",
+                              10, panel_midpoint, y_start, is_recent_loss=True)
+    _draw_track_list_in_panel(canvas, long_term_lost, "Long-Term Lost (Global Search)",
+                              panel_midpoint + 10, canvas.shape[1], y_start, is_recent_loss=False)
 
 def _draw_reid_debug_panel(canvas: np.ndarray, reid_debug_info: dict, y_start: int, panel_h: int):
     """Draws the Re-ID candidate comparison panel."""
@@ -190,15 +213,6 @@ def draw_hud(frame: np.ndarray, stats: Dict):
 
     draw_text("Frame", stats.get('Frame', 'N/A'))
     draw_text("FPS", f"{stats.get('FPS', 0):.1f}")
-    if 'Scheduler' in stats:
-        y += 5; draw_text("-- Scheduler --")
-        draw_text("  Budget", stats['Scheduler'].get('Budget', 'N/A'))
-        draw_text("  Backlog", stats['Scheduler'].get('Backlog', 'N/A'))
-        draw_text("  Actions", stats['Scheduler'].get('Actions', 'N/A'))
-    if 'Tracker' in stats:
-        y += 5; draw_text("-- Tracker --")
-        draw_text("  Active", stats['Tracker'].get('Active', 'N/A'))
-        draw_text("  Lost", stats['Tracker'].get('Lost', 'N/A'))
 
 def draw_reid_links(frame: np.ndarray, reid_events: List[Dict], tracks: list):
     """Draws visual links for Re-ID events, using state-based color."""
@@ -236,7 +250,7 @@ def create_enhanced_frame(
     draw_reid_links(canvas, reid_events, tracks)
 
     lost_panel_y_start = frame_h
-    _draw_lost_panel(canvas, tracks, lost_panel_y_start, panel_h)
+    _draw_all_lost_tracks_panel(canvas, tracks, lost_panel_y_start, panel_h)
 
     reid_panel_y_start = frame_h + panel_h
     _draw_reid_debug_panel(canvas, reid_debug_info, reid_panel_y_start, panel_h)
