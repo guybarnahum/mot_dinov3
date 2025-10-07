@@ -6,7 +6,7 @@ fps = 30.0 # Force output FPS to 30
 source = "data/input.mp4"
 output = "outputs/processed_with_viz.mp4"
 start_frame = 300
-end_frame = 900
+end_frame = 600
 
 [detector]
 det = "yolo11l.pt"
@@ -52,7 +52,7 @@ motion_gate = true
 # For the first 30 frames a track is lost, the tracker will search for it
 # near its predicted position (extrapolated from its last known velocity).
 # The search radius grows over time as defined by center_gate_base/slope.
-extrapolation_window = 180
+extrapolation_window = 60
 
 # After 'extrapolation_window' frames, the tracker assumes the motion prediction
 # is unreliable and switches to a global, appearance-only search for that track.

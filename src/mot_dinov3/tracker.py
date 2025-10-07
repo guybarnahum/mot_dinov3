@@ -77,8 +77,9 @@ class Track:
     last_conf: float = 0.0
     center_history: deque = field(default_factory=lambda: deque(maxlen=25), repr=False)
     last_known_crop: Optional[np.ndarray] = field(default=None, repr=False)
-    
-    # --- MODIFIED: Kalman Filter now manages the track's motion state ---
+    search_radius: float = 0.0
+
+    # Kalman Filter manages the track's motion state
     kf: KalmanFilter = field(default_factory=KalmanFilter, repr=False)
 
     def __post_init__(self):
@@ -308,12 +309,17 @@ class SimpleTracker:
             self._process_reid_group(lost_global_idx, det_left_ids, unmatched_dets, boxes, embs, frame, clses, confs, use_motion_gating=False)
 
     def _process_reid_group(self, lost_idx_group: List[int], det_ids: List[int], unmatched_dets: Set[int],
-                            boxes: np.ndarray, embs: np.ndarray, frame: np.ndarray, clses: Optional[np.ndarray],
-                            confs: Optional[np.ndarray], use_motion_gating: bool):
+                        boxes: np.ndarray, embs: np.ndarray, frame: np.ndarray, clses: Optional[np.ndarray],
+                        confs: Optional[np.ndarray], use_motion_gating: bool):
+        """Helper to run the Re-ID process for a given group of lost tracks."""
+        
         lost_tracks = [self.tracks[i] for i in lost_idx_group]
         det_embs_subset = embs[det_ids]
+
+        # 1. Calculate appearance cost
         cost_app = utils.cosine_cost_matrix(np.stack([t.emb for t in lost_tracks]), det_embs_subset)
         
+        # 2. Capture Re-ID candidates for the debug visualization panel
         if self.reid_debug_k > 0:
             for i, track in enumerate(lost_tracks):
                 if track.tid in self.reid_debug_info: continue
@@ -323,6 +329,7 @@ class SimpleTracker:
                 candidates = []
                 for det_idx_in_subset in top_k_indices:
                     if sim_scores[det_idx_in_subset] < self.reid_sim_thresh * 0.5: continue
+                    
                     original_det_idx = det_ids[det_idx_in_subset]
                     candidate_box = boxes[original_det_idx]
                     candidates.append({
@@ -340,16 +347,27 @@ class SimpleTracker:
         cost_matrix = cost_app.copy()
         cost_matrix[cost_app > (1.0 - self.reid_sim_thresh)] = 1e6
         
+        # 3. Apply motion gating if enabled
         if use_motion_gating and self.motion_gate:
-            # --- MODIFIED: Predictions now come directly from the Kalman Filter's predicted state ---
-            # The 'center' property of a track now refers to the KF's predicted position for this frame.
+            # Get predicted positions from the Kalman Filter state
             pred_centers = np.stack([t.center for t in lost_tracks])
             det_centers = utils.centers_xyxy(boxes[det_ids])
             dist = np.linalg.norm(pred_centers[:, np.newaxis, :] - det_centers[np.newaxis, :, :], axis=2)
             
+            # Calculate the velocity-adaptive search radius for each track
             time_since = np.array([t.time_since_update for t in lost_tracks])
-            allowance = self.center_gate_base + self.center_gate_slope * time_since
+            velocities = np.stack([t.velocity for t in lost_tracks])
+            velocity_magnitudes = np.linalg.norm(velocities, axis=1)
+            growth_rate_slope = (velocity_magnitudes * self.motion_gate_vel_factor) + self.motion_gate_min_growth
+            allowance = self.motion_gate_base + growth_rate_slope * time_since
+            
+            # Store the calculated radius on each track (the "single source of truth")
+            for i, track in enumerate(lost_tracks):
+                track.search_radius = allowance[i]
+            
+            # Apply the gating to the cost matrix
             cost_matrix[dist > allowance[:, np.newaxis]] = 1e6
 
+        # 4. Perform the association
         unmatched_lost = set(range(len(lost_idx_group)))
         self._associate(cost_matrix, unmatched_dets, unmatched_lost, lost_idx_group, det_ids, boxes, embs, frame, clses, confs, is_reid=True)

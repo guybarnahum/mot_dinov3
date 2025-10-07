@@ -157,11 +157,11 @@ def draw_hud(frame: np.ndarray, stats: Dict):
 def draw_tracks(frame: np.ndarray, tracks: list, tracker_config: dict):
     """Draws tracks, trails, and predicted search areas onto the frame."""
     H, W = frame.shape[:2]
-    # MODIFIED: Get threshold from config
     recent_loss_threshold = tracker_config.get('extrapolation_window', 30)
+    debug_color = (0, 255, 255) # Yellow for debug visuals
 
     for t in tracks:
-        color = _state_to_color(t, recent_loss_threshold) # MODIFIED: Pass threshold
+        color = _state_to_color(t, recent_loss_threshold)
         
         if t.state == "active":
             x1, y1, x2, y2 = np.clip(t.box, [0, 0, 0, 0], [W - 1, H - 1, W - 1, H - 1]).astype(int)
@@ -174,17 +174,18 @@ def draw_tracks(frame: np.ndarray, tracks: list, tracker_config: dict):
         elif t.state == "lost" and t.time_since_update <= recent_loss_threshold:
             last_seen_center = tuple(utils.centers_xyxy(t.box[np.newaxis, :])[0].astype(int))
             last_x1, last_y1, last_x2, last_y2 = t.box.astype(int)
-            debug_color = (0, 255, 255)
             
+            # Draw debug visuals for the last known position
             cv2.rectangle(frame, (last_x1, last_y1), (last_x2, last_y2), debug_color, 1)
             cv2.line(frame, (last_seen_center[0] - 7, last_seen_center[1]), (last_seen_center[0] + 7, last_seen_center[1]), debug_color, 1)
             cv2.line(frame, (last_seen_center[0], last_seen_center[1] - 7), (last_seen_center[0], last_seen_center[1] + 7), debug_color, 1)
             
-            time_delta = t.time_since_update - 1
-            pred_center = tuple(t.center.astype(int)) # With KF, t.center is already the prediction
-            allowance = tracker_config.get('center_gate_base', 50.0) + tracker_config.get('center_gate_slope', 10.0) * t.time_since_update
+            # --- MODIFIED: Simply read the search_radius from the track object ---
+            pred_center = tuple(t.center.astype(int))
+            allowance = t.search_radius # The single source of truth
             
             cv2.circle(frame, pred_center, int(allowance), color, 1, cv2.LINE_AA)
+            
             if t.time_since_update > 1:
                 cv2.line(frame, last_seen_center, pred_center, color, 1, cv2.LINE_AA)
 
