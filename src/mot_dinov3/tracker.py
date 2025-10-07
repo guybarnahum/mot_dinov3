@@ -41,34 +41,37 @@ class Track:
         self.center = utils.centers_xyxy(self.box[np.newaxis, :])[0]
         self.center_history.append(self.center.astype(int))
 
-    def update(self, det_boxes: np.ndarray, det_embs: np.ndarray, frame: np.ndarray,
-            confs: Optional[np.ndarray] = None, clses: Optional[np.ndarray] = None) -> Tuple[List[Track], List[Dict], Dict]:
-        self.reid_events_this_frame.clear()
-        self.reid_debug_info.clear()
-        N = len(det_boxes)
 
-        # --- Stage 1: Associate ACTIVE tracks (Now a single, unified stage) ---
-        act_idx = [i for i, t in enumerate(self.tracks) if t.state == "active"]
+    def update(self, box: np.ndarray, emb: np.ndarray,
+            det_conf: float = 1.0, det_cls: Optional[int] = None,
+            conf_min_update: float = 0.3, conf_update_weight: float = 0.5,
+            class_vote_smoothing: float = 0.6, class_decay_factor: float = 0.05):
         
-        det_ids = list(range(N)) # Use all detections at once
+        old_center = self.center
+        self.center = utils.centers_xyxy(box[np.newaxis, :])[0]
+        velocity = self.center - old_center
+        self.velocity = 0.7 * self.velocity + 0.3 * velocity 
         
-        unmatched_dets, unmatched_tracks = self._match_active(
-            act_idx, det_ids, det_boxes, det_embs, frame, clses, confs
-        )
-        
-        for ti in unmatched_tracks:
-            self.tracks[ti].mark_lost()
-        
-        # --- Stage 2: Re-ID LOST tracks ---
-        self._reid_lost(unmatched_dets, det_boxes, det_embs, frame, clses, confs)
+        self.center_history.append(self.center.astype(int))
+        self.box = box.astype(np.float32)
 
-        # --- Stage 3: Create new tracks ---
-        for j in sorted(list(unmatched_dets)):
-            cls = int(clses[j]) if clses is not None else None
-            self._new_track(det_boxes[j], det_embs[j], cls, frame)
+        det_conf = float(np.clip(det_conf, 0.0, 1.0))
+        if det_conf >= conf_min_update:
+            beta = (1.0 - self.alpha) * (conf_update_weight * det_conf + (1.0 - conf_update_weight))
+            x = (1.0 - beta) * self.emb + beta * emb
+            self.emb = (x / (np.linalg.norm(x) + 1e-12)).astype(np.float32)
             
-        self._prune_removed()
-        return self.tracks, self.reid_events_this_frame, self.reid_debug_info
+            self.gallery.append(emb.astype(np.float32).copy())
+            if len(self.gallery) > self.gallery_max: self.gallery.pop(0)
+
+            if det_cls is not None and det_cls >= 0:
+                self._update_class_hist(det_cls, det_conf, class_vote_smoothing, class_decay_factor)
+
+        self.hits += 1
+        self.time_since_update = 0
+        self.age += 1
+        self.state = "active"
+        self.last_conf = det_conf
 
     def _match_active(self, act_idx: List[int], det_ids: List[int], boxes: np.ndarray, embs: np.ndarray, frame: np.ndarray, 
                     clses: Optional[np.ndarray], confs: Optional[np.ndarray]):
@@ -219,37 +222,36 @@ class SimpleTracker:
             unmatched_dets.discard(j)
             unmatched_tracks.discard(ti)
 
-    # --- UPDATED: Method signature changed to accept 'frame' and return 'reid_debug_info' ---
+
     def update(self, det_boxes: np.ndarray, det_embs: np.ndarray, frame: np.ndarray,
-               confs: Optional[np.ndarray] = None, clses: Optional[np.ndarray] = None) -> Tuple[List[Track], List[Dict], Dict]:
+            confs: Optional[np.ndarray] = None, clses: Optional[np.ndarray] = None) -> Tuple[List[Track], List[Dict], Dict]:
         self.reid_events_this_frame.clear()
-        self.reid_debug_info.clear() # Clear debug info each frame
+        self.reid_debug_info.clear()
         N = len(det_boxes)
 
-        # --- Stage 1: Associate ACTIVE tracks ---
-        if confs is not None:
-            hi_ids, lo_ids = [i for i, c in enumerate(confs) if c >= self.conf_high], [i for i, c in enumerate(confs) if self.conf_low <= c < self.conf_high]
-        else: hi_ids, lo_ids = list(range(N)), []
+        # --- Stage 1: Associate ACTIVE tracks (Unified stage) ---
         act_idx = [i for i, t in enumerate(self.tracks) if t.state == "active"]
-        unmatched_tracks = set(act_idx)
-        # --- UPDATED: Pass 'frame' to matching functions ---
-        unmatched_hi, unmatched_tracks = self._match_active(list(unmatched_tracks), hi_ids, det_boxes, det_embs, frame, clses, confs, use_iou_only=False)
-        unmatched_lo, unmatched_tracks = self._match_active(list(unmatched_tracks), lo_ids, det_boxes, det_embs, frame, clses, confs, use_iou_only=self.low_conf_iou_only)
-        for ti in unmatched_tracks: self.tracks[ti].mark_lost()
+        det_ids = list(range(N)) # Use all detections at once
         
-        # --- Stage 2: Re-ID LOST tracks (now passes 'frame') ---
-        unmatched_dets = unmatched_hi.union(unmatched_lo)
+        unmatched_dets, unmatched_tracks = self._match_active(
+            act_idx, det_ids, det_boxes, det_embs, frame, clses, confs
+        )
+        
+        for ti in unmatched_tracks:
+            self.tracks[ti].mark_lost()
+        
+        # --- Stage 2: Re-ID LOST tracks ---
         self._reid_lost(unmatched_dets, det_boxes, det_embs, frame, clses, confs)
 
-        # --- Stage 3: Create new tracks (now passes 'frame') ---
+        # --- Stage 3: Create new tracks ---
         for j in sorted(list(unmatched_dets)):
             cls = int(clses[j]) if clses is not None else None
             self._new_track(det_boxes[j], det_embs[j], cls, frame)
             
         self._prune_removed()
         return self.tracks, self.reid_events_this_frame, self.reid_debug_info
+    
 
-    # --- UPDATED: Method signature changed to accept 'frame' ---
     def _match_active(self, act_idx: List[int], det_ids: List[int], boxes: np.ndarray, embs: np.ndarray, frame: np.ndarray, 
                       clses: Optional[np.ndarray], confs: Optional[np.ndarray], use_iou_only: bool = False):
         unmatched_dets, unmatched_tracks = set(det_ids), set(act_idx)
