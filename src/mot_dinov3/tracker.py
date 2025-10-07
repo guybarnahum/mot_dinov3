@@ -41,36 +41,72 @@ class Track:
         self.center = utils.centers_xyxy(self.box[np.newaxis, :])[0]
         self.center_history.append(self.center.astype(int))
 
-    def update(self, box: np.ndarray, emb: np.ndarray,
-               det_conf: float = 1.0, det_cls: Optional[int] = None,
-               conf_min_update: float = 0.3, conf_update_weight: float = 0.5,
-               class_vote_smoothing: float = 0.6, class_decay_factor: float = 0.05):
-        
-        old_center = self.center
-        self.center = utils.centers_xyxy(box[np.newaxis, :])[0]
-        velocity = self.center - old_center
-        self.velocity = 0.7 * self.velocity + 0.3 * velocity 
-        
-        self.center_history.append(self.center.astype(int))
-        self.box = box.astype(np.float32)
+# In src/mot_dinov3/tracker.py
 
-        det_conf = float(np.clip(det_conf, 0.0, 1.0))
-        if det_conf >= conf_min_update:
-            beta = (1.0 - self.alpha) * (conf_update_weight * det_conf + (1.0 - conf_update_weight))
-            x = (1.0 - beta) * self.emb + beta * emb
-            self.emb = (x / (np.linalg.norm(x) + 1e-12)).astype(np.float32)
+# REPLACE the entire update() function with this corrected version:
+def update(self, det_boxes: np.ndarray, det_embs: np.ndarray, frame: np.ndarray,
+           confs: Optional[np.ndarray] = None, clses: Optional[np.ndarray] = None) -> Tuple[List[Track], List[Dict], Dict]:
+    self.reid_events_this_frame.clear()
+    self.reid_debug_info.clear()
+    N = len(det_boxes)
+
+    # --- Stage 1: Associate ACTIVE tracks (Now a single, unified stage) ---
+    act_idx = [i for i, t in enumerate(self.tracks) if t.state == "active"]
+    
+    det_ids = list(range(N)) # Use all detections at once
+    
+    unmatched_dets, unmatched_tracks = self._match_active(
+        act_idx, det_ids, det_boxes, det_embs, frame, clses, confs
+    )
+    
+    for ti in unmatched_tracks:
+        self.tracks[ti].mark_lost()
+    
+    # --- Stage 2: Re-ID LOST tracks ---
+    self._reid_lost(unmatched_dets, det_boxes, det_embs, frame, clses, confs)
+
+    # --- Stage 3: Create new tracks ---
+    for j in sorted(list(unmatched_dets)):
+        cls = int(clses[j]) if clses is not None else None
+        self._new_track(det_boxes[j], det_embs[j], cls, frame)
+        
+    self._prune_removed()
+    return self.tracks, self.reid_events_this_frame, self.reid_debug_info
+
+    def _match_active(self, act_idx: List[int], det_ids: List[int], boxes: np.ndarray, embs: np.ndarray, frame: np.ndarray, 
+                    clses: Optional[np.ndarray], confs: Optional[np.ndarray]):
+        unmatched_dets, unmatched_tracks = set(det_ids), set(act_idx)
+        if not act_idx or not det_ids:
+            return unmatched_dets, unmatched_tracks
+        
+        track_boxes = np.stack([self.tracks[i].box for i in act_idx])
+        cost_iou = 1.0 - utils.iou_matrix(track_boxes, boxes[det_ids])
+        
+        track_embs = np.stack([self.tracks[i].emb for i in act_idx])
+        cost_app = utils.cosine_cost_matrix(track_embs, embs[det_ids])
+        
+        cost_matrix = self.iou_w * cost_iou + self.app_w * cost_app
+
+        # --- MODIFIED: Apply different thresholds based on confidence within the single matrix ---
+        # This preserves the original intent in a safer way.
+        if confs is not None and self.low_conf_iou_only:
+            det_confs = confs[det_ids]
+            is_low_conf = det_confs < self.conf_high
             
-            self.gallery.append(emb.astype(np.float32).copy())
-            if len(self.gallery) > self.gallery_max: self.gallery.pop(0)
+            # For low-confidence detections, apply the looser IoU threshold
+            low_conf_iou_mask = cost_iou[:, is_low_conf] > (1.0 - self.iou_thresh_low)
+            cost_matrix[:, is_low_conf][low_conf_iou_mask] = 1e6
 
-            if det_cls is not None and det_cls >= 0:
-                self._update_class_hist(det_cls, det_conf, class_vote_smoothing, class_decay_factor)
-
-        self.hits += 1
-        self.time_since_update = 0
-        self.age += 1
-        self.state = "active"
-        self.last_conf = det_conf
+            # For high-confidence detections, apply the stricter IoU threshold
+            high_conf_iou_mask = cost_iou[:, ~is_low_conf] > (1.0 - self.iou_thresh)
+            cost_matrix[:, ~is_low_conf][high_conf_iou_mask] = 1e6
+        else:
+            # Fallback to the single stricter threshold if not using confidence logic
+            cost_matrix[cost_iou > (1.0 - self.iou_thresh)] = 1e6
+            
+        cost_matrix = self._add_soft_class_penalty(cost_matrix, act_idx, det_ids, clses)
+        self._associate(cost_matrix, unmatched_dets, unmatched_tracks, act_idx, det_ids, boxes, embs, frame, clses, confs)
+        return unmatched_dets, unmatched_tracks
 
     def _update_class_hist(self, det_cls: int, det_conf: float, smoothing: float, decay: float):
         w = det_conf * smoothing
