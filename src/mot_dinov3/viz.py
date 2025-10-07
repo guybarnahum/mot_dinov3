@@ -184,6 +184,7 @@ def draw_legend(frame: np.ndarray):
         cv2.putText(frame, label, (x + 30, y_pos + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
 # ---------- Public API ----------
+# In src/mot_dinov3/viz.py
 
 def draw_tracks(frame: np.ndarray, tracks: list, tracker_config: dict):
     """Draws tracks, trails, and predicted search areas onto the frame."""
@@ -204,28 +205,26 @@ def draw_tracks(frame: np.ndarray, tracks: list, tracker_config: dict):
             _draw_label(frame, f"ID {t.tid}", (x1, y1), color)
 
         elif t.state == "lost" and t.time_since_update <= RECENT_LOSS_THRESHOLD:
-            # --- NEW DEBUG VISUALIZATION FOR RECENTLY LOST TRACKS ---
+            # --- MODIFIED: Calculate last_seen_center from the frozen t.box ---
+            last_seen_center = tuple(utils.centers_xyxy(t.box[np.newaxis, :])[0].astype(int))
+            
             # 1. Draw a thin yellow box at the last known BBox
             last_x1, last_y1, last_x2, last_y2 = t.box.astype(int)
             cv2.rectangle(frame, (last_x1, last_y1), (last_x2, last_y2), debug_color, 1)
 
-            # 2. Draw a yellow crosshair at the last known center (from the KF state)
-            last_known_center = tuple(t.center.astype(int))
-            cv2.line(frame, (last_known_center[0] - 7, last_known_center[1]), (last_known_center[0] + 7, last_known_center[1]), debug_color, 1)
-            cv2.line(frame, (last_known_center[0], last_known_center[1] - 7), (last_known_center[0], last_known_center[1] + 7), debug_color, 1)
-            # --- END OF NEW DEBUG VISUALIZATION ---
-
-            # 3. Draw the original orange search area (prediction)
-            time_delta = t.time_since_update - 1
-            pred_center = (t.center + t.velocity * time_delta).astype(int)
+            # 2. Draw a yellow crosshair at the FROZEN last_seen_center
+            cv2.line(frame, (last_seen_center[0] - 7, last_seen_center[1]), (last_seen_center[0] + 7, last_seen_center[1]), debug_color, 1)
+            cv2.line(frame, (last_seen_center[0], last_seen_center[1] - 7), (last_seen_center[0], last_seen_center[1] + 7), debug_color, 1)
+            
+            # 3. Draw the orange search area at the PREDICTED position (t.center)
+            pred_center = tuple(t.center.astype(int))
             allowance = tracker_config.get('center_gate_base', 50.0) + \
                         tracker_config.get('center_gate_slope', 10.0) * t.time_since_update
+            cv2.circle(frame, pred_center, int(allowance), color, 1, cv2.LINE_AA)
             
-            cv2.circle(frame, tuple(pred_center), int(allowance), color, 1, cv2.LINE_AA)
-            
-            # 4. Draw the prediction line
-            if time_delta > 0:
-                cv2.line(frame, last_known_center, tuple(pred_center), color, 1, cv2.LINE_AA)
+            # 4. Draw the prediction line from last seen to predicted
+            if t.time_since_update > 1:
+                cv2.line(frame, last_seen_center, pred_center, color, 1, cv2.LINE_AA)
 
 def draw_hud(frame: np.ndarray, stats: Dict):
     """Draws a Heads-Up Display with system statistics."""
