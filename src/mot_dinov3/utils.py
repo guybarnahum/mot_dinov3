@@ -47,15 +47,16 @@ def cosine_cost_matrix(A: np.ndarray, B: np.ndarray) -> np.ndarray:
     # Cost is 1 - similarity
     return (1.0 - similarity).astype(np.float32)
 
-
 def centers_xyxy(b: np.ndarray) -> np.ndarray:
     """Calculates the centers of boxes in XYXY format."""
     if len(b) == 0:
         return np.zeros((0, 2), dtype=np.float32)
+    
     cx = (b[:, 0] + b[:, 2]) * 0.5
-    cy = (b[:, 1] + b[:, 2]) * 0.5
+    # --- CORRECTED: Use y2 (b[:, 3]) instead of x2 (b[:, 2]) ---
+    cy = (b[:, 1] + b[:, 3]) * 0.5
+    
     return np.stack([cx, cy], axis=1).astype(np.float32)
-
 
 def get_crop(frame: np.ndarray, box: np.ndarray) -> np.ndarray:
     """
