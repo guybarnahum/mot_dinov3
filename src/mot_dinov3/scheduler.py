@@ -12,7 +12,6 @@ import torch
 # Assuming utils.iou_matrix exists in the same package
 from . import utils
 
-
 @dataclass
 class SchedulerConfig:
     """Configuration for the EmbeddingScheduler."""
@@ -20,7 +19,7 @@ class SchedulerConfig:
     iou_gate: float = 0.6
     refresh_every: int = 5
     ema_alpha: float = 0.35
-
+    force_compute_all: bool = False
 
 class EmbeddingScheduler:
     """
@@ -70,6 +69,14 @@ class EmbeddingScheduler:
         """
         N = len(boxes)
         active = [t for t in getattr(tracker, "tracks", []) if getattr(t, "state", "active") == "active"]
+
+        if self.cfg.force_compute_all:
+            # If true, bypass all logic and mark every detection for computation.
+            iou_active_det = np.zeros((len(active), N), dtype=np.float32)
+            return (
+                np.ones(N, dtype=bool), [None] * N, active,
+                np.zeros(N, dtype=bool), np.zeros(N, dtype=bool), [None] * N, iou_active_det
+            )
 
         if N == 0 or not active:
             iou_active_det = np.zeros((len(active), N), dtype=np.float32)
@@ -167,6 +174,7 @@ class EmbeddingScheduler:
         embs = np.zeros((N, D), dtype=np.float32)
         computed_tids: set[int] = set()
         reason_map: Dict[int, str] = {} # Will stay empty if viz_info is None
+        reason_map: Dict[int, str] = {}
 
         # Handle reuse
         if active:
@@ -176,10 +184,9 @@ class EmbeddingScheduler:
                     embs[j] = tid2emb[tid]
                     self.stat_reuse += 1
 
-        # --- Compute Critical Embeddings (not budgeted) ---
+        # Compute Critical Embeddings (not budgeted)
         idx_crit = np.where(need_mask & ~due_mask)[0]
         if len(idx_crit) > 0:
-            # **VIZ LOGIC**: Only build the reason map if visualization is enabled.
             if viz_info is not None:
                 for j in idx_crit:
                     reason_map[j] = 'C-crowd' if crowd_mask[j] else 'C-new'
@@ -188,28 +195,23 @@ class EmbeddingScheduler:
             embs[idx_crit] = embs_crit
             computed_tids |= self._mark_computed(active, idx_crit, frame_idx, iou_active_det, viz_info, reason_map)
 
-        # --- Compute Refresh Embeddings (budgeted) ---
+        # Compute Refresh Embeddings (budgeted)
         if on_cuda: torch.cuda.synchronize()
         used_ms = (perf_counter() - t0) * 1000.0
         remaining_ms = max(0.0, budget_ms - used_ms) if budget_ms > 0 else float('inf')
 
-        if remaining_ms > 0 and active:
-            track_source_for_viz = viz_info is not None
-            idx_refresh, backlog_tids = self._get_budgeted_refresh_indices(
-                active, match_tid, due_mask, idx_crit, iou_active_det, t0, budget_ms,
-                track_source=track_source_for_viz
+        if remaining_ms > 0:
+            # --- MODIFIED: Identify refresh candidates directly by their detection index ---
+            refresh_candidate_indices = np.where(due_mask)[0]
+            
+            idx_refresh = self._get_budgeted_refresh_indices(
+                refresh_candidate_indices, match_tid, t0, budget_ms
             )
             
             if len(idx_refresh) > 0:
-                # **VIZ LOGIC**: Refine reasons for refresh items.
                 if viz_info is not None:
-                    tid_to_det_map = self._map_tids_to_best_det(active, iou_active_det)
-                    for tid in backlog_tids:
-                        if (det_idx := tid_to_det_map.get(tid)) is not None:
-                            reason_map[det_idx] = 'R-backlog'
                     for j in idx_refresh:
-                        if j not in reason_map: # Avoid overwriting R-backlog
-                           reason_map[j] = 'R-due'
+                        reason_map[j] = 'R-refresh'
 
                 embs_ref, _ = self._compute_embeddings(frame, boxes, idx_refresh, embedder, on_cuda)
                 embs[idx_refresh] = embs_ref
@@ -217,6 +219,30 @@ class EmbeddingScheduler:
 
         if on_cuda: torch.cuda.synchronize()
         return embs, perf_counter() - t0, computed_tids
+
+    # In scheduler.py, replace the _get_budgeted_refresh_indices() method:
+    def _get_budgeted_refresh_indices(self, candidate_indices: np.ndarray,
+                                    match_tid: list[Optional[int]],
+                                    t0: float, budget_ms: float) -> np.ndarray:
+        """Determines which detection indices to refresh within the time budget."""
+        if len(candidate_indices) == 0:
+            return np.array([], dtype=int)
+        
+        # Prioritize items that are already in the pending backlog
+        backlog_indices = [idx for idx in candidate_indices if match_tid[idx] in self.pending_refresh]
+        due_indices = [idx for idx in candidate_indices if match_tid[idx] not in self.pending_refresh]
+        
+        # Process backlog first, then newly due items
+        prioritized_indices = backlog_indices + due_indices
+        
+        idx_to_process = []
+        for det_idx in prioritized_indices:
+            # Predict if computing one more embedding will exceed the budget
+            if budget_ms > 0 and (perf_counter() - t0) * 1000.0 + self.ms_per_crop_ema > budget_ms:
+                break
+            idx_to_process.append(det_idx)
+                
+        return np.array(idx_to_process, dtype=int)
 
     def _compute_embeddings(self, frame, boxes, indices, embedder, on_cuda):
         """Helper to run embedder, time it, and update stats."""
@@ -228,32 +254,6 @@ class EmbeddingScheduler:
         self.update_ema_ms_per_crop(batch_ms, len(indices))
         self.stat_real += len(indices)
         return embeddings, batch_ms
-
-    def _get_budgeted_refresh_indices(self, active, match_tid, due_mask, idx_crit, iou_active_det, t0, budget_ms, track_source: bool = False):
-        """Determines which tracks to refresh within the time budget."""
-        due_tids_this = {match_tid[j] for j in np.where(due_mask)[0] if match_tid[j] is not None}
-        
-        backlog_candidates = list(self.pending_refresh)
-        due_candidates = [t for t in sorted(due_tids_this, reverse=True) if t not in self.pending_refresh]
-        candidates = backlog_candidates + due_candidates
-        
-        tid_to_det_map = self._map_tids_to_best_det(active, iou_active_det)
-        
-        idx_refresh = []
-        processed_from_backlog = set()
-
-        for tid in candidates:
-            if budget_ms > 0 and (perf_counter() - t0) * 1000.0 + self.ms_per_crop_ema > budget_ms:
-                break
-
-            det_idx = tid_to_det_map.get(tid)
-            if det_idx is not None and det_idx not in idx_crit and det_idx not in idx_refresh:
-                idx_refresh.append(det_idx)
-                # **VIZ LOGIC**: Only track source if requested.
-                if track_source and tid in backlog_candidates:
-                    processed_from_backlog.add(tid)
-        
-        return np.array(idx_refresh, dtype=int), processed_from_backlog
 
     def _map_tids_to_best_det(self, active_snapshot, iou_active_det: np.ndarray) -> dict[int, int]:
         """For each active track, find the detection index with the highest IoU."""
