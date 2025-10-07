@@ -6,6 +6,8 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
+from . import utils
+
 # --- Public constants for easy tuning of the debug view ---
 DEBUG_PANEL_HEIGHT = 200
 DEBUG_THUMBNAIL_SIZE = (120, 120)
