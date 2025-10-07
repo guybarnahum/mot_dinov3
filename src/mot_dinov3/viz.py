@@ -189,25 +189,43 @@ def draw_tracks(frame: np.ndarray, tracks: list, tracker_config: dict):
     """Draws tracks, trails, and predicted search areas onto the frame."""
     H, W = frame.shape[:2]
     RECENT_LOSS_THRESHOLD = tracker_config.get('extrapolation_window', 30)
+    debug_color = (0, 255, 255) # Yellow for debug visuals
 
     for t in tracks:
         color = _state_to_color(t)
-        x1, y1, x2, y2 = np.clip(t.box, [0, 0, 0, 0], [W - 1, H - 1, W - 1, H - 1]).astype(int)
-        
-        if t.state == "active" and len(t.center_history) > 1:
-            points = np.array(list(t.center_history), dtype=np.int32).reshape((-1, 1, 2))
-            cv2.polylines(frame, [points], isClosed=False, color=color, thickness=2, lineType=cv2.LINE_AA)
-        
-        if t.state == "lost" and t.time_since_update <= RECENT_LOSS_THRESHOLD:
-            pred_center = (t.center + t.velocity * t.time_since_update).astype(int)
-            allowance = tracker_config.get('center_gate_base', 50.0) + \
-                        tracker_config.get('center_gate_slope', 10.0) * t.time_since_update
-            cv2.circle(frame, tuple(pred_center), int(allowance), color, 1, cv2.LINE_AA)
-            cv2.line(frame, tuple(t.center.astype(int)), tuple(pred_center), color, 1, cv2.LINE_AA)
         
         if t.state == "active":
-             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
-        _draw_label(frame, f"ID {t.tid}", (x1, y1), color)
+            x1, y1, x2, y2 = np.clip(t.box, [0, 0, 0, 0], [W - 1, H - 1, W - 1, H - 1]).astype(int)
+            # Draw trail and box for active tracks
+            if len(t.center_history) > 1:
+                points = np.array(list(t.center_history), dtype=np.int32).reshape((-1, 1, 2))
+                cv2.polylines(frame, [points], isClosed=False, color=color, thickness=2, lineType=cv2.LINE_AA)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
+            _draw_label(frame, f"ID {t.tid}", (x1, y1), color)
+
+        elif t.state == "lost" and t.time_since_update <= RECENT_LOSS_THRESHOLD:
+            # --- NEW DEBUG VISUALIZATION FOR RECENTLY LOST TRACKS ---
+            # 1. Draw a thin yellow box at the last known BBox
+            last_x1, last_y1, last_x2, last_y2 = t.box.astype(int)
+            cv2.rectangle(frame, (last_x1, last_y1), (last_x2, last_y2), debug_color, 1)
+
+            # 2. Draw a yellow crosshair at the last known center (from the KF state)
+            last_known_center = tuple(t.center.astype(int))
+            cv2.line(frame, (last_known_center[0] - 7, last_known_center[1]), (last_known_center[0] + 7, last_known_center[1]), debug_color, 1)
+            cv2.line(frame, (last_known_center[0], last_known_center[1] - 7), (last_known_center[0], last_known_center[1] + 7), debug_color, 1)
+            # --- END OF NEW DEBUG VISUALIZATION ---
+
+            # 3. Draw the original orange search area (prediction)
+            time_delta = t.time_since_update - 1
+            pred_center = (t.center + t.velocity * time_delta).astype(int)
+            allowance = tracker_config.get('center_gate_base', 50.0) + \
+                        tracker_config.get('center_gate_slope', 10.0) * t.time_since_update
+            
+            cv2.circle(frame, tuple(pred_center), int(allowance), color, 1, cv2.LINE_AA)
+            
+            # 4. Draw the prediction line
+            if time_delta > 0:
+                cv2.line(frame, last_known_center, tuple(pred_center), color, 1, cv2.LINE_AA)
 
 def draw_hud(frame: np.ndarray, stats: Dict):
     """Draws a Heads-Up Display with system statistics."""
