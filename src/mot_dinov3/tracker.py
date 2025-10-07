@@ -41,34 +41,34 @@ class Track:
         self.center = utils.centers_xyxy(self.box[np.newaxis, :])[0]
         self.center_history.append(self.center.astype(int))
 
-def update(self, det_boxes: np.ndarray, det_embs: np.ndarray, frame: np.ndarray,
-           confs: Optional[np.ndarray] = None, clses: Optional[np.ndarray] = None) -> Tuple[List[Track], List[Dict], Dict]:
-    self.reid_events_this_frame.clear()
-    self.reid_debug_info.clear()
-    N = len(det_boxes)
+    def update(self, det_boxes: np.ndarray, det_embs: np.ndarray, frame: np.ndarray,
+            confs: Optional[np.ndarray] = None, clses: Optional[np.ndarray] = None) -> Tuple[List[Track], List[Dict], Dict]:
+        self.reid_events_this_frame.clear()
+        self.reid_debug_info.clear()
+        N = len(det_boxes)
 
-    # --- Stage 1: Associate ACTIVE tracks (Now a single, unified stage) ---
-    act_idx = [i for i, t in enumerate(self.tracks) if t.state == "active"]
-    
-    det_ids = list(range(N)) # Use all detections at once
-    
-    unmatched_dets, unmatched_tracks = self._match_active(
-        act_idx, det_ids, det_boxes, det_embs, frame, clses, confs
-    )
-    
-    for ti in unmatched_tracks:
-        self.tracks[ti].mark_lost()
-    
-    # --- Stage 2: Re-ID LOST tracks ---
-    self._reid_lost(unmatched_dets, det_boxes, det_embs, frame, clses, confs)
-
-    # --- Stage 3: Create new tracks ---
-    for j in sorted(list(unmatched_dets)):
-        cls = int(clses[j]) if clses is not None else None
-        self._new_track(det_boxes[j], det_embs[j], cls, frame)
+        # --- Stage 1: Associate ACTIVE tracks (Now a single, unified stage) ---
+        act_idx = [i for i, t in enumerate(self.tracks) if t.state == "active"]
         
-    self._prune_removed()
-    return self.tracks, self.reid_events_this_frame, self.reid_debug_info
+        det_ids = list(range(N)) # Use all detections at once
+        
+        unmatched_dets, unmatched_tracks = self._match_active(
+            act_idx, det_ids, det_boxes, det_embs, frame, clses, confs
+        )
+        
+        for ti in unmatched_tracks:
+            self.tracks[ti].mark_lost()
+        
+        # --- Stage 2: Re-ID LOST tracks ---
+        self._reid_lost(unmatched_dets, det_boxes, det_embs, frame, clses, confs)
+
+        # --- Stage 3: Create new tracks ---
+        for j in sorted(list(unmatched_dets)):
+            cls = int(clses[j]) if clses is not None else None
+            self._new_track(det_boxes[j], det_embs[j], cls, frame)
+            
+        self._prune_removed()
+        return self.tracks, self.reid_events_this_frame, self.reid_debug_info
 
     def _match_active(self, act_idx: List[int], det_ids: List[int], boxes: np.ndarray, embs: np.ndarray, frame: np.ndarray, 
                     clses: Optional[np.ndarray], confs: Optional[np.ndarray]):
@@ -124,7 +124,6 @@ def update(self, det_boxes: np.ndarray, det_embs: np.ndarray, frame: np.ndarray,
             if sim > best: best = sim
         return best
 
-    # --- NEW & CORRECTED: Property to determine if a track is static ---
     @property
     def is_static(self) -> bool:
         """Returns True if the track's velocity is below a threshold."""
