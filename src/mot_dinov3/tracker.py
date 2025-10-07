@@ -1,4 +1,4 @@
-# src/mot_dinov3/tracker.py (Corrected and Refactored)
+# src/mot_dinov3/tracker.py (Refactored with Kalman Filter)
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -15,9 +15,53 @@ try:
 except ImportError:
     HAS_HUNGARIAN = False
 
+# --- NEW: A self-contained Linear Kalman Filter for motion tracking ---
+class KalmanFilter:
+    """
+    A simple Kalman filter for tracking objects in 2D space with constant velocity.
+    The state is [x, y, vx, vy].
+    The measurement is [x, y].
+    """
+    def __init__(self, dt: float = 1.0, std_acc: float = 1.0, x_std_meas: float = 1.0, y_std_meas: float = 1.0):
+        self.dt = dt
+        # State transition matrix
+        self.F = np.array([[1, 0, dt, 0],
+                           [0, 1, 0, dt],
+                           [0, 0, 1, 0],
+                           [0, 0, 0, 1]])
+        # Measurement matrix
+        self.H = np.array([[1, 0, 0, 0],
+                           [0, 1, 0, 0]])
+        # Process noise covariance (models acceleration uncertainty)
+        self.Q = np.array([[(dt**4)/4, 0, (dt**3)/2, 0],
+                           [0, (dt**4)/4, 0, (dt**3)/2],
+                           [(dt**3)/2, 0, dt**2, 0],
+                           [0, (dt**3)/2, 0, dt**2]]) * std_acc**2
+        # Measurement noise covariance (models sensor uncertainty)
+        self.R = np.array([[x_std_meas**2, 0],
+                           [0, y_std_meas**2]])
+        # Initial state estimate [x, y, vx, vy] and covariance
+        self.x = np.zeros(4)
+        self.P = np.eye(4) * 500.0
+
+    def predict(self):
+        """Predicts the next state."""
+        self.x = np.dot(self.F, self.x)
+        self.P = np.dot(np.dot(self.F, self.P), self.F.T) + self.Q
+        return self.x
+
+    def update(self, z: np.ndarray):
+        """Updates the state with a new measurement z."""
+        y = z - np.dot(self.H, self.x)
+        S = self.R + np.dot(self.H, np.dot(self.P, self.H.T))
+        K = np.dot(np.dot(self.P, self.H.T), np.linalg.inv(S))
+        self.x = self.x + np.dot(K, y)
+        I = np.eye(4)
+        self.P = np.dot(I - np.dot(K, self.H), self.P)
+
 @dataclass
 class Track:
-    """A class to represent a single tracked object."""
+    """A class to represent a single tracked object, now using a Kalman Filter."""
     tid: int
     box: np.ndarray
     emb: np.ndarray
@@ -31,32 +75,42 @@ class Track:
     gallery_max: int = 10
     cls_hist: Dict[int, float] = field(default_factory=dict, repr=False)
     last_conf: float = 0.0
-    center: np.ndarray = field(init=False)
-    velocity: np.ndarray = field(default_factory=lambda: np.array([0.0, 0.0]), repr=False)
     center_history: deque = field(default_factory=lambda: deque(maxlen=25), repr=False)
     last_known_crop: Optional[np.ndarray] = field(default=None, repr=False)
+    
+    # --- MODIFIED: Kalman Filter now manages the track's motion state ---
+    kf: KalmanFilter = field(default_factory=KalmanFilter, repr=False)
 
     def __post_init__(self):
-        """Initialize calculated fields after object creation."""
-        self.center = utils.centers_xyxy(self.box[np.newaxis, :])[0]
-        self.center_history.append(self.center.astype(int))
+        """Initialize the Kalman Filter with the first detection."""
+        initial_center = utils.centers_xyxy(self.box[np.newaxis, :])[0]
+        self.kf.x[:2] = initial_center.reshape(2)
+        self.center_history.append(initial_center.astype(int))
+
+    # --- MODIFIED: Center and velocity are now properties derived from the Kalman Filter's state ---
+    @property
+    def center(self) -> np.ndarray:
+        return self.kf.x[:2]
+    
+    @property
+    def velocity(self) -> np.ndarray:
+        return self.kf.x[2:]
 
     def update(self, box: np.ndarray, emb: np.ndarray,
                det_conf: float = 1.0, det_cls: Optional[int] = None,
                conf_min_update: float = 0.3, conf_update_weight: float = 0.5,
                class_vote_smoothing: float = 0.6, class_decay_factor: float = 0.05):
-        """
-        Updates the state of the track with a new detection.
-        Age is not incremented here; it's handled globally.
-        """
-        old_center = self.center
-        self.center = utils.centers_xyxy(box[np.newaxis, :])[0]
-        velocity = self.center - old_center
-        self.velocity = 0.7 * self.velocity + 0.3 * velocity 
-        
-        self.center_history.append(self.center.astype(int))
+        """Updates the track's state with a new detection."""
         self.box = box.astype(np.float32)
+        
+        # Feed the new bounding box center measurement to the Kalman Filter
+        new_center_measurement = utils.centers_xyxy(box[np.newaxis, :])[0]
+        self.kf.update(new_center_measurement)
+        
+        # The center property will now reflect the smoothed state
+        self.center_history.append(self.center.astype(int))
 
+        # Update appearance embedding with EMA
         det_conf = float(np.clip(det_conf, 0.0, 1.0))
         if det_conf >= conf_min_update:
             beta = (1.0 - self.alpha) * (conf_update_weight * det_conf + (1.0 - conf_update_weight))
@@ -70,12 +124,11 @@ class Track:
                 self._update_class_hist(det_cls, det_conf, class_vote_smoothing, class_decay_factor)
 
         self.hits += 1
-        self.time_since_update = 0  # Reset the timer
-        self.state = "active"       # Mark as active
+        self.time_since_update = 0
+        self.state = "active"
         self.last_conf = det_conf
 
     def _update_class_hist(self, det_cls: int, det_conf: float, smoothing: float, decay: float):
-        """Updates the smoothed history of class predictions."""
         w = det_conf * smoothing
         self.cls_hist[det_cls] = self.cls_hist.get(det_cls, 0.0) * (1.0 - w) + w
         for k in list(self.cls_hist.keys()):
@@ -85,13 +138,12 @@ class Track:
         if self.cls_hist: self.cls = max(self.cls_hist.items(), key=lambda kv: kv[1])[0]
 
     def mark_lost(self):
-        """Marks the track as lost if it was previously active."""
+        """Marks the track as lost."""
         if self.state == "active":
             self.state = "lost"
-            self.time_since_update = 1 # Start the lost counter at 1
+            self.time_since_update = 1
 
     def best_sim(self, emb: np.ndarray) -> float:
-        """Calculates the best similarity score against the gallery."""
         best = float(self.emb @ emb)
         for g_emb in self.gallery[-5:]:
             sim = float(g_emb @ emb)
@@ -104,11 +156,7 @@ class Track:
         STATIC_VELOCITY_THRESHOLD = 1.5 
         return np.linalg.norm(self.velocity) < STATIC_VELOCITY_THRESHOLD
 
-
 class SimpleTracker:
-    """
-    A simple tracking-by-detection implementation.
-    """
     def __init__(self, **kwargs):
         self.iou_w = kwargs.get('iou_weight', 0.3)
         self.app_w = kwargs.get('app_weight', 0.7)
@@ -139,7 +187,6 @@ class SimpleTracker:
         self.reid_debug_info: Dict = {}
 
     def _new_track(self, box: np.ndarray, emb: np.ndarray, cls: Optional[int], frame: np.ndarray) -> Track:
-        """Creates and adds a new track."""
         t = Track(tid=self._next_id, box=box, emb=emb, cls=cls if (cls is not None and cls >= 0) else None,
                   alpha=self.ema_alpha, gallery_max=self.gallery_size)
         t.last_known_crop = utils.get_crop(frame, box)
@@ -149,13 +196,11 @@ class SimpleTracker:
         return t
 
     def _prune_removed(self):
-        """Removes tracks that have been lost for too long."""
         self.tracks = [t for t in self.tracks if not (t.state == "lost" and t.time_since_update > self.reid_max_age)]
 
     def _associate(self, cost_matrix: np.ndarray, unmatched_dets: Set[int], unmatched_tracks: Set[int],
                    act_idx: List[int], det_ids: List[int], boxes: np.ndarray, embs: np.ndarray,
                    frame: np.ndarray, clses: Optional[np.ndarray], confs: Optional[np.ndarray], is_reid: bool = False):
-        """Performs assignment and updates track states."""
         if self.use_hungarian:
             rows, cols = linear_sum_assignment(cost_matrix)
         else:
@@ -186,8 +231,9 @@ class SimpleTracker:
     def update(self, det_boxes: np.ndarray, det_embs: np.ndarray, frame: np.ndarray,
                confs: Optional[np.ndarray] = None, clses: Optional[np.ndarray] = None) -> Tuple[List[Track], List[Dict], Dict]:
         """The main entry point for updating the tracker state with a new frame."""
-        # --- PREDICT STEP: Advance the state of all existing tracks ---
+        # --- MODIFIED: The "predict" step now updates the Kalman Filter state for each track ---
         for t in self.tracks:
+            t.kf.predict() # Predict next state based on the KF's motion model
             t.age += 1
             if t.state == 'lost':
                 t.time_since_update += 1
@@ -196,7 +242,6 @@ class SimpleTracker:
         self.reid_debug_info.clear()
         N = len(det_boxes)
 
-        # --- STAGE 1: Associate ACTIVE tracks in a single, unified stage ---
         act_idx = [i for i, t in enumerate(self.tracks) if t.state == "active"]
         det_ids = list(range(N))
         
@@ -207,10 +252,8 @@ class SimpleTracker:
         for ti in unmatched_tracks:
             self.tracks[ti].mark_lost()
         
-        # --- STAGE 2: Re-ID LOST tracks ---
         self._reid_lost(unmatched_dets, det_boxes, det_embs, frame, clses, confs)
 
-        # --- STAGE 3: Create new tracks from remaining detections ---
         for j in sorted(list(unmatched_dets)):
             cls = int(clses[j]) if clses is not None else None
             self._new_track(det_boxes[j], det_embs[j], cls, frame)
@@ -220,12 +263,12 @@ class SimpleTracker:
 
     def _match_active(self, act_idx: List[int], det_ids: List[int], boxes: np.ndarray, embs: np.ndarray, frame: np.ndarray, 
                       clses: Optional[np.ndarray], confs: Optional[np.ndarray]):
-        """Matches active tracks against all available detections."""
         unmatched_dets, unmatched_tracks = set(det_ids), set(act_idx)
         if not act_idx or not det_ids:
             return unmatched_dets, unmatched_tracks
         
-        track_boxes = np.stack([self.tracks[i].box for i in act_idx])
+        # --- MODIFIED: Get predicted boxes from Kalman Filter state ---
+        track_boxes = np.stack([self.tracks[i].box for i in act_idx]) # IoU is still based on last known box
         cost_iou = 1.0 - utils.iou_matrix(track_boxes, boxes[det_ids])
         
         track_embs = np.stack([self.tracks[i].emb for i in act_idx])
@@ -233,16 +276,11 @@ class SimpleTracker:
         
         cost_matrix = self.iou_w * cost_iou + self.app_w * cost_app
 
-        # Apply different IoU thresholds based on detection confidence
         if confs is not None:
             det_confs = confs[det_ids]
             is_low_conf = det_confs < self.conf_high
-            
-            # For low-confidence detections, use the looser IoU threshold
             low_conf_iou_mask = cost_iou[:, is_low_conf] > (1.0 - self.iou_thresh_low)
             cost_matrix[:, is_low_conf][low_conf_iou_mask] = 1e6
-
-            # For high-confidence detections, use the stricter IoU threshold
             high_conf_iou_mask = cost_iou[:, ~is_low_conf] > (1.0 - self.iou_thresh)
             cost_matrix[:, ~is_low_conf][high_conf_iou_mask] = 1e6
         else:
@@ -253,23 +291,18 @@ class SimpleTracker:
 
     def _reid_lost(self, unmatched_dets: Set[int], boxes: np.ndarray, embs: np.ndarray, frame: np.ndarray,
                    clses: Optional[np.ndarray], confs: Optional[np.ndarray]):
-        """Matches lost tracks against remaining detections."""
         if not unmatched_dets: return
-        
         lost_idx = [i for i, t in enumerate(self.tracks) if t.state == "lost"]
         if not lost_idx: return
         
-        # Split lost tracks into recent (gated) and old (global) search groups
         lost_tracks_all = [self.tracks[i] for i in lost_idx]
         lost_gated_idx = [i for i, t in zip(lost_idx, lost_tracks_all) if t.time_since_update <= self.extrapolation_window]
         lost_global_idx = [i for i, t in zip(lost_idx, lost_tracks_all) if t.time_since_update > self.extrapolation_window]
         
-        # Phase 2a: Gated Re-ID for recently lost tracks
         det_left_ids = sorted(list(unmatched_dets))
         if lost_gated_idx and det_left_ids:
             self._process_reid_group(lost_gated_idx, det_left_ids, unmatched_dets, boxes, embs, frame, clses, confs, use_motion_gating=True)
 
-        # Phase 2b: Global Re-ID for long-lost tracks
         det_left_ids = sorted(list(unmatched_dets))
         if lost_global_idx and det_left_ids:
             self._process_reid_group(lost_global_idx, det_left_ids, unmatched_dets, boxes, embs, frame, clses, confs, use_motion_gating=False)
@@ -277,12 +310,10 @@ class SimpleTracker:
     def _process_reid_group(self, lost_idx_group: List[int], det_ids: List[int], unmatched_dets: Set[int],
                             boxes: np.ndarray, embs: np.ndarray, frame: np.ndarray, clses: Optional[np.ndarray],
                             confs: Optional[np.ndarray], use_motion_gating: bool):
-        """Helper to run the Re-ID process for a given group of lost tracks."""
         lost_tracks = [self.tracks[i] for i in lost_idx_group]
         det_embs_subset = embs[det_ids]
         cost_app = utils.cosine_cost_matrix(np.stack([t.emb for t in lost_tracks]), det_embs_subset)
         
-        # Capture Re-ID candidates for debug visualization
         if self.reid_debug_k > 0:
             for i, track in enumerate(lost_tracks):
                 if track.tid in self.reid_debug_info: continue
@@ -292,7 +323,6 @@ class SimpleTracker:
                 candidates = []
                 for det_idx_in_subset in top_k_indices:
                     if sim_scores[det_idx_in_subset] < self.reid_sim_thresh * 0.5: continue
-                    
                     original_det_idx = det_ids[det_idx_in_subset]
                     candidate_box = boxes[original_det_idx]
                     candidates.append({
@@ -311,10 +341,13 @@ class SimpleTracker:
         cost_matrix[cost_app > (1.0 - self.reid_sim_thresh)] = 1e6
         
         if use_motion_gating and self.motion_gate:
-            time_since = np.array([t.time_since_update for t in lost_tracks])
-            pred_centers = np.stack([t.center for t in lost_tracks]) + np.stack([t.velocity for t in lost_tracks]) * time_since[:, np.newaxis]
+            # --- MODIFIED: Predictions now come directly from the Kalman Filter's predicted state ---
+            # The 'center' property of a track now refers to the KF's predicted position for this frame.
+            pred_centers = np.stack([t.center for t in lost_tracks])
             det_centers = utils.centers_xyxy(boxes[det_ids])
             dist = np.linalg.norm(pred_centers[:, np.newaxis, :] - det_centers[np.newaxis, :, :], axis=2)
+            
+            time_since = np.array([t.time_since_update for t in lost_tracks])
             allowance = self.center_gate_base + self.center_gate_slope * time_since
             cost_matrix[dist > allowance[:, np.newaxis]] = 1e6
 
