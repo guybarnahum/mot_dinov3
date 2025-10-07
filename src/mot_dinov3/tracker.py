@@ -41,9 +41,6 @@ class Track:
         self.center = utils.centers_xyxy(self.box[np.newaxis, :])[0]
         self.center_history.append(self.center.astype(int))
 
-# In src/mot_dinov3/tracker.py
-
-# REPLACE the entire update() function with this corrected version:
 def update(self, det_boxes: np.ndarray, det_embs: np.ndarray, frame: np.ndarray,
            confs: Optional[np.ndarray] = None, clses: Optional[np.ndarray] = None) -> Tuple[List[Track], List[Dict], Dict]:
     self.reid_events_this_frame.clear()
@@ -87,8 +84,6 @@ def update(self, det_boxes: np.ndarray, det_embs: np.ndarray, frame: np.ndarray,
         
         cost_matrix = self.iou_w * cost_iou + self.app_w * cost_app
 
-        # --- MODIFIED: Apply different thresholds based on confidence within the single matrix ---
-        # This preserves the original intent in a safer way.
         if confs is not None and self.low_conf_iou_only:
             det_confs = confs[det_ids]
             is_low_conf = det_confs < self.conf_high
