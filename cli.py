@@ -88,7 +88,7 @@ class SchedulerParams:
     refresh_every: int = 5
     ema_alpha: float = 0.35
     embed_budget_ms: float = 0.0
-    force_compute_all: bool: True
+    force_compute_all: bool = True
 
 @dataclass
 class TrackerParams:
