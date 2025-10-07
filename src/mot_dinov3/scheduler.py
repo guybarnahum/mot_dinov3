@@ -173,7 +173,6 @@ class EmbeddingScheduler:
 
         embs = np.zeros((N, D), dtype=np.float32)
         computed_tids: set[int] = set()
-        reason_map: Dict[int, str] = {} # Will stay empty if viz_info is None
         reason_map: Dict[int, str] = {}
 
         # Handle reuse
