@@ -174,13 +174,17 @@ class SimpleTracker:
         self.conf_min_update = kwargs.get('conf_min_update', 0.3)
         self.conf_update_weight = kwargs.get('conf_update_weight', 0.5)
         self.low_conf_iou_only = kwargs.get('low_conf_iou_only', True)
-        self.center_gate_base = kwargs.get('center_gate_base', 50.0)
-        self.center_gate_slope = kwargs.get('center_gate_slope', 10.0)
         self.class_vote_smoothing = kwargs.get('class_vote_smoothing', 0.6)
         self.class_decay_factor = kwargs.get('class_decay_factor', 0.05)
         self.motion_gate = kwargs.get('motion_gate', True)
         self.extrapolation_window = kwargs.get('extrapolation_window', 30)
         self.reid_debug_k = kwargs.get('reid_debug_k', 3)
+        
+        # --- ADD THESE MISSING PARAMETERS ---
+        # These initialize the attributes for the velocity-adaptive search area.
+        self.motion_gate_base = kwargs.get('motion_gate_base', 25.0)
+        self.motion_gate_vel_factor = kwargs.get('motion_gate_vel_factor', 2.0)
+        self.motion_gate_min_growth = kwargs.get('motion_gate_min_growth', 2.0)
         
         self.tracks: List[Track] = []
         self._next_id = 1
