@@ -60,10 +60,10 @@ def _resize_crop(crop: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
     return canvas
 
 # ---------- Panel and Legend Drawing Functions ----------
-
 def _draw_track_list_in_panel(canvas: np.ndarray, tracks_to_draw: list, title: str,
-                              x_start: int, x_end: int, y_start: int, is_recent_loss: bool,
-                              recent_loss_threshold: int): # MODIFIED: Accept threshold
+                              x_start: int, x_end: int, y_start: int,
+                              recent_loss_threshold: int):
+    """A generic helper to draw a titled list of track thumbnails in a panel section."""
     _draw_label(canvas, title, (x_start, y_start + 25), (150, 150, 150), font_scale=0.6)
     
     thumb_w, thumb_h = DEBUG_THUMBNAIL_SIZE
@@ -77,24 +77,25 @@ def _draw_track_list_in_panel(canvas: np.ndarray, tracks_to_draw: list, title: s
         thumbnail = _resize_crop(t.last_known_crop, (thumb_w, thumb_h))
         canvas[y_pos:y_pos + thumb_h, x_offset:x_offset + thumb_w] = thumbnail
         
-        color = _state_to_color(t, recent_loss_threshold) # MODIFIED: Pass threshold
+        color = _state_to_color(t, recent_loss_threshold)
         label = f"ID {t.tid} ({t.time_since_update}f)"
         _draw_label(canvas, label, (x_offset, y_pos + thumb_h + 20), color)
         
         arrow_start_pt = (x_offset + thumb_w // 2, y_pos + thumb_h // 2)
-        if is_recent_loss:
-            arrow_end_pt = tuple((t.center + t.velocity * (t.time_since_update - 1)).astype(int))
-        else:
-            arrow_end_pt = tuple(t.center.astype(int))
+        
+        # --- CORRECTED: The arrow's endpoint is now simply t.center ---
+        # This matches the logic used for the search circle, ensuring they align perfectly.
+        arrow_end_pt = tuple(t.center.astype(int))
+        
         _draw_arrow(canvas, arrow_start_pt, arrow_end_pt, color, absolute_tip_pixels=ARROW_TIP_PIXELS)
         
         x_offset += thumb_w + 10
 
 def _draw_all_lost_tracks_panel(canvas: np.ndarray, tracks: list, y_start: int, panel_h: int, tracker_config: dict):
+    """Draws a panel with two sorted lists: recently lost and long-term lost tracks."""
     cv2.rectangle(canvas, (0, y_start), (canvas.shape[1], y_start + panel_h), (20, 20, 20), -1)
     
     lost_tracks = sorted([t for t in tracks if t.state == "lost"], key=lambda t: t.time_since_update)
-    # MODIFIED: Get threshold from config
     recent_loss_threshold = tracker_config.get('extrapolation_window', 30)
     
     recent_lost = [t for t in lost_tracks if t.time_since_update <= recent_loss_threshold]
@@ -103,11 +104,11 @@ def _draw_all_lost_tracks_panel(canvas: np.ndarray, tracks: list, y_start: int, 
     panel_midpoint = canvas.shape[1] // 2
     cv2.line(canvas, (panel_midpoint, y_start), (panel_midpoint, y_start + panel_h), (80, 80, 80), 1)
 
-    # MODIFIED: Pass threshold down to helper
+    # --- MODIFIED: Simplified the function call (removed is_recent_loss) ---
     _draw_track_list_in_panel(canvas, recent_lost, "Recently Lost (Gated Search)",
-                              10, panel_midpoint, y_start, True, recent_loss_threshold)
+                              10, panel_midpoint, y_start, recent_loss_threshold)
     _draw_track_list_in_panel(canvas, long_term_lost, "Long-Term Lost (Global Search)",
-                              panel_midpoint + 10, canvas.shape[1], y_start, False, recent_loss_threshold)
+                              panel_midpoint + 10, canvas.shape[1], y_start, recent_loss_threshold)
 
 def _draw_reid_debug_panel(canvas: np.ndarray, reid_debug_info: dict, y_start: int, panel_h: int):
     # ... (This function is correct)
