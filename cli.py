@@ -257,7 +257,7 @@ def setup_video_io(io_cfg: IOParams, viz_cfg: VizParams, meta: Dict[str, Any]) -
         cap.set(cv2.CAP_PROP_POS_FRAMES, io_cfg.start_frame)
         
     out_w, out_h = meta["width"], meta["height"]
-    # --- MODIFIED: Use the imported constant to calculate the exact height ---
+    
     if viz_cfg.debug_panels:
         out_h += DEBUG_PANEL_HEIGHT * 2
         print(f"💡 Debug panels enabled. Output resolution set to {out_w}x{out_h}.")
@@ -336,10 +336,9 @@ def run_processing_loop(cfg: Config, cap: cv2.VideoCapture, writer: cv2.VideoWri
 
             if cfg.viz.debug_panels:
                 output_frame = create_enhanced_frame(
-                    frame, tracks, reid_events, reid_debug_info, tracker_config_dict, hud_stats
+                    frame, tracks, reid_events, reid_debug_info, tracker_config_dict, hud_stats,frame_idx=frame_idx
                 )
             else:
-                # --- FIX #2: Use the corrected function calls for simple visualization ---
                 output_frame = frame
                 # The new draw_tracks function uses the config dict and internally handles drawing lost tracks
                 draw_tracks(output_frame, tracks, tracker_config_dict)

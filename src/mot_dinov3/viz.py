@@ -11,20 +11,29 @@ from . import utils
 # --- Public constants for easy tuning of the debug view ---
 DEBUG_PANEL_HEIGHT = 200
 DEBUG_THUMBNAIL_SIZE = (120, 120)
-ARROW_TIP_PIXELS = 15
+ARROW_TIP_PIXELS = 10
 
 # ---------- Color helpers ----------
+
+from typing import Tuple
+
+# Named Color Constants (BGR format)
+COLOR_DYNAMIC_ACTIVE = (0, 200, 50)    # Green
+COLOR_STATIC_ACTIVE  = (200, 120, 0)   # Blue
+COLOR_RECENT_LOST    = (0, 165, 255)   # Orange
+COLOR_LONG_TERM_LOST = (0, 0, 220)     # Red
+COLOR_DEFAULT        = (255, 255, 255) # White
 
 def _state_to_color(track, recent_loss_threshold: int) -> Tuple[int, int, int]:
     """Returns a BGR color based on the track's state."""
     if track.state == "active":
-        return (200, 120, 0) if track.is_static else (0, 200, 50)
+        return COLOR_STATIC_ACTIVE if track.is_static else COLOR_DYNAMIC_ACTIVE
     elif track.state == "lost":
         if track.time_since_update <= recent_loss_threshold:
-            return (0, 165, 255)
+            return COLOR_RECENT_LOST
         else:
-            return (0, 0, 220)
-    return (255, 255, 255)
+            return COLOR_LONG_TERM_LOST
+    return COLOR_DEFAULT
 
 # ---------- Drawing helpers ----------
 
@@ -70,8 +79,9 @@ def _resize_crop(crop: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
 
 # ---------- Panel and Legend Drawing Functions ----------
 
-def _draw_track_list_in_panel(canvas: np.ndarray, arrow_overlay: np.ndarray, tracks_to_draw: list, title: str,
-                              x_start: int, x_end: int, y_start: int, recent_loss_threshold: int):
+def _draw_track_list_in_panel(canvas: np.ndarray, tracks_to_draw: list, title: str,
+                              x_start: int, x_end: int, y_start: int,
+                              recent_loss_threshold: int):
     """A generic helper to draw a titled list of track thumbnails in a panel section."""
     _draw_label(canvas, title, (x_start, y_start + 25), (150, 150, 150), font_scale=0.6)
     
@@ -88,7 +98,6 @@ def _draw_track_list_in_panel(canvas: np.ndarray, arrow_overlay: np.ndarray, tra
         
         color = _state_to_color(t, recent_loss_threshold)
         
-        # Draw ID and Velocity on separate lines for clarity
         id_label = f"ID {t.tid} ({t.time_since_update}f)"
         _draw_label(canvas, id_label, (x_offset, y_pos + thumb_h + 20), color)
         
@@ -100,7 +109,8 @@ def _draw_track_list_in_panel(canvas: np.ndarray, arrow_overlay: np.ndarray, tra
         arrow_start_pt = (x_offset + thumb_w // 2, y_pos + thumb_h // 2)
         arrow_end_pt = tuple(utils.centers_xyxy(t.box[np.newaxis, :])[0].astype(int))
         
-        _draw_arrow(arrow_overlay, arrow_start_pt, arrow_end_pt, color, absolute_tip_pixels=ARROW_TIP_PIXELS)
+        # Draw the arrow directly onto the main canvas
+        _draw_arrow(canvas, arrow_start_pt, arrow_end_pt, color, absolute_tip_pixels=ARROW_TIP_PIXELS)
         
         x_offset += thumb_w + 10
 
@@ -117,32 +127,37 @@ def _draw_all_lost_tracks_panel(canvas: np.ndarray, tracks: list, y_start: int, 
     panel_midpoint = canvas.shape[1] // 2
     cv2.line(canvas, (panel_midpoint, y_start), (panel_midpoint, y_start + panel_h), (80, 80, 80), 1)
 
-    # Create an overlay for drawing semi-transparent arrows
-    arrow_overlay = np.zeros_like(canvas)
-
-    _draw_track_list_in_panel(canvas, arrow_overlay, recent_lost, "Recently Lost (Gated Search)",
+    # Call the helper for each section (no overlay is needed)
+    _draw_track_list_in_panel(canvas, recent_lost, "Recently Lost (Gated Search)",
                               10, panel_midpoint, y_start, recent_loss_threshold)
-    _draw_track_list_in_panel(canvas, arrow_overlay, long_term_lost, "Long-Term Lost (Global Search)",
+    _draw_track_list_in_panel(canvas, long_term_lost, "Long-Term Lost (Global Search)",
                               panel_midpoint + 10, canvas.shape[1], y_start, recent_loss_threshold)
-    
-    # Blend the arrow overlay onto the main canvas
-    alpha = 0.6  # 60% opacity for the arrows
-    cv2.addWeighted(arrow_overlay, alpha, canvas, 1.0, 0, canvas)
 
-def _draw_reid_debug_panel(canvas: np.ndarray, reid_debug_info: dict, y_start: int, panel_h: int):
-    """Draws the Re-ID candidate comparison panel."""
+# In src/mot_dinov3/viz.py
+
+def _draw_reid_debug_panel(canvas: np.ndarray, reid_debug_info: dict, y_start: int, panel_h: int, frame_idx: int):
+    """Draws the Re-ID candidate comparison panel, cycling through available tracks."""
     cv2.rectangle(canvas, (0, y_start), (canvas.shape[1], y_start + panel_h), (20, 20, 20), -1)
     _draw_label(canvas, "Re-ID Candidate Matching", (10, y_start + 25), (150, 150, 150), font_scale=0.6)
+
     if not reid_debug_info: return
-    
-    query_tid = next(iter(reid_debug_info))
+
+    # --- MODIFIED: Cycle through all available lost tracks using the frame index ---
+    lost_tids = sorted(list(reid_debug_info.keys()))
+    if not lost_tids: return
+
+    # Pick a track to focus on for this frame
+    focus_idx = frame_idx % len(lost_tids)
+    query_tid = lost_tids[focus_idx]
     info = reid_debug_info[query_tid]
+    
     thumb_w, thumb_h = DEBUG_THUMBNAIL_SIZE
     x_offset, y_pos = 10, y_start + 40
     
     if info['query_crop'] is not None:
         query_thumb = _resize_crop(info['query_crop'], (thumb_w, thumb_h))
         canvas[y_pos:y_pos + thumb_h, x_offset:x_offset + thumb_w] = query_thumb
+        # Display which track is being focused on
         _draw_label(canvas, f"Query ID {query_tid}", (x_offset, y_pos + thumb_h + 20), (255, 255, 0))
     
     x_offset += thumb_w + 20
@@ -245,14 +260,16 @@ def draw_reid_links(frame: np.ndarray, reid_events: List[Dict], tracks: list, tr
         cv2.circle(frame, c_new, 6, reid_color, -1, cv2.LINE_AA)
         _draw_label(frame, f"Re-ID: {event['score']:.2f}", c_new, reid_color)
 
+
 def create_enhanced_frame(frame: np.ndarray, tracks: list, reid_events: List[Dict],
-                          reid_debug_info: dict, tracker_config: dict, hud_stats: dict) -> np.ndarray:
+                        reid_debug_info: dict, tracker_config: dict, hud_stats: dict,
+                        frame_idx: int) -> np.ndarray: 
     """Creates a single large frame with the main view and debug panels."""
     frame_h, frame_w = frame.shape[:2]
     panel_h = DEBUG_PANEL_HEIGHT
     canvas = np.zeros((frame_h + panel_h * 2, frame_w, 3), dtype=np.uint8)
     canvas[:frame_h, :, :] = frame
-    
+
     draw_tracks(canvas, tracks, tracker_config)
     draw_reid_links(canvas, reid_events, tracks, tracker_config)
 
@@ -260,8 +277,9 @@ def create_enhanced_frame(frame: np.ndarray, tracks: list, reid_events: List[Dic
     _draw_all_lost_tracks_panel(canvas, tracks, lost_panel_y_start, panel_h, tracker_config)
 
     reid_panel_y_start = frame_h + panel_h
-    _draw_reid_debug_panel(canvas, reid_debug_info, reid_panel_y_start, panel_h)
-    
+    # --- MODIFIED: Pass frame_idx to the debug panel ---
+    _draw_reid_debug_panel(canvas, reid_debug_info, reid_panel_y_start, panel_h, frame_idx)
+
     draw_legend(canvas)
     if hud_stats:
         draw_hud(canvas, hud_stats)
