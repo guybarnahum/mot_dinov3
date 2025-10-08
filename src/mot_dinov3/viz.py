@@ -60,8 +60,11 @@ def _resize_crop(crop: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
     return canvas
 
 # ---------- Panel and Legend Drawing Functions ----------
+# In src/mot_dinov3/viz.py
+
+# REPLACE this entire helper function with the corrected version below
 def _draw_track_list_in_panel(canvas: np.ndarray, tracks_to_draw: list, title: str,
-                              x_start: int, x_end: int, y_start: int,
+                              x_start: int, x_end: int, y_start: int, is_recent_loss: bool,
                               recent_loss_threshold: int):
     """A generic helper to draw a titled list of track thumbnails in a panel section."""
     _draw_label(canvas, title, (x_start, y_start + 25), (150, 150, 150), font_scale=0.6)
@@ -78,14 +81,20 @@ def _draw_track_list_in_panel(canvas: np.ndarray, tracks_to_draw: list, title: s
         canvas[y_pos:y_pos + thumb_h, x_offset:x_offset + thumb_w] = thumbnail
         
         color = _state_to_color(t, recent_loss_threshold)
+        
+        # --- MODIFIED: Add the velocity vector to the label for recent losses ---
         label = f"ID {t.tid} ({t.time_since_update}f)"
+        if is_recent_loss:
+            vx, vy = t.velocity
+            label += f" v=[{vx:.1f},{vy:.1f}]"
+        
         _draw_label(canvas, label, (x_offset, y_pos + thumb_h + 20), color)
         
         arrow_start_pt = (x_offset + thumb_w // 2, y_pos + thumb_h // 2)
         
-        # --- CORRECTED: The arrow's endpoint is now simply t.center ---
-        # This matches the logic used for the search circle, ensuring they align perfectly.
-        arrow_end_pt = tuple(t.center.astype(int))
+        # --- CORRECTED: Arrow now always points to the last SEEN position (the yellow crosshair) ---
+        # This is calculated from the frozen t.box, not the predicted t.center.
+        arrow_end_pt = tuple(utils.centers_xyxy(t.box[np.newaxis, :])[0].astype(int))
         
         _draw_arrow(canvas, arrow_start_pt, arrow_end_pt, color, absolute_tip_pixels=ARROW_TIP_PIXELS)
         
