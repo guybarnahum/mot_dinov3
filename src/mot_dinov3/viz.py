@@ -221,30 +221,39 @@ def draw_reid_links(frame: np.ndarray, reid_events: List[Dict], tracks: list, tr
         _draw_label(frame, f"Re-ID: {event['score']:.2f}", c_new, reid_color)
 
 def _draw_reid_debug_panel(canvas: np.ndarray, reid_debug_info: dict, reid_events: list, 
-                           y_start: int, panel_h: int):
-    """Draws a multi-row panel showing all Re-ID candidates and highlighting winners."""
+                           y_start: int, panel_h: int, frame_idx: int):
+    """Draws a multi-row panel showing a rotating selection of Re-ID candidates."""
     
     lost_tids = sorted(list(reid_debug_info.keys()))
     num_lost = len(lost_tids)
     
     # Draw panel background and a dynamic title
     cv2.rectangle(canvas, (0, y_start), (canvas.shape[1], y_start + panel_h), (20, 20, 20), -1)
-    title = f"Re-ID Candidate Matching ({num_lost} Track{'s' if num_lost != 1 else ''})"
+    title = f"Re-ID Candidates for Lost Tracks"
     _draw_label(canvas, title, (10, y_start + 25), (150, 150, 150), font_scale=0.6)
 
     if not lost_tids: return
 
-    # Find the successful Re-ID matches for this frame to highlight them
-    successful_reids = {e['tid']: e['new_box'] for e in reid_events}
+    # --- NEW: Logic to show a rotating subset of multiple tracks ---
+    max_queries_to_show = 3 # Show up to 3 lost tracks at a time
+    
+    # Rotate the selection every 5 frames for a smoother scroll
+    start_idx = (frame_idx // 5) % num_lost
+    
+    # Get a "slice" of tracks to show, wrapping around the list if necessary
+    tids_to_show = [lost_tids[(start_idx + i) % num_lost] for i in range(min(max_queries_to_show, num_lost))]
+    
+    # Update title with a counter
+    _draw_label(canvas, f"(Showing {len(tids_to_show)} of {num_lost})", (270, y_start + 25), (150, 150, 150), font_scale=0.6)
 
+    successful_reids = {e['tid']: e['new_box'] for e in reid_events}
     thumb_w, thumb_h = DEBUG_THUMBNAIL_SIZE
     x_offset, y_offset = 10, y_start + 40
     row_height = thumb_h + 40
 
-    for query_tid in lost_tids:
-        # If adding a new row would exceed the panel height, stop
-        if y_offset + row_height > y_start + panel_h:
-            break
+    # Loop through the subset of tracks selected for this frame
+    for query_tid in tids_to_show:
+        if y_offset + row_height > y_start + panel_h: break
 
         info = reid_debug_info[query_tid]
         
@@ -265,23 +274,18 @@ def _draw_reid_debug_panel(canvas: np.ndarray, reid_debug_info: dict, reid_event
             canvas[y_offset:y_offset + thumb_h, cand_x:cand_x + thumb_w] = cand_thumb
             score = cand['score']
             
-            # Check if this candidate was the winner
             is_winner = False
-            if query_tid in successful_reids:
-                # Compare bounding boxes to see if this is the matched one
-                if np.array_equal(cand['box'], successful_reids[query_tid]):
-                    is_winner = True
+            if query_tid in successful_reids and np.array_equal(cand['box'], successful_reids[query_tid]):
+                is_winner = True
             
             label_color = (0, 255, 0) if is_winner else (0, 215, 255)
             _draw_label(canvas, f"Score: {score:.2f}", (cand_x, y_offset + thumb_h + 20), label_color)
 
-            # Add a green border for the winning candidate
             if is_winner:
                 cv2.rectangle(canvas, (cand_x, y_offset), (cand_x + thumb_w, y_offset + thumb_h), (0, 255, 0), 2)
             
             cand_x += thumb_w + 10
             
-        # Move to the next row
         y_offset += row_height
 
 def create_enhanced_frame(frame: np.ndarray, tracks: list, reid_events: List[Dict],
