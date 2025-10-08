@@ -133,46 +133,6 @@ def _draw_all_lost_tracks_panel(canvas: np.ndarray, tracks: list, y_start: int, 
     _draw_track_list_in_panel(canvas, long_term_lost, "Long-Term Lost (Global Search)",
                               panel_midpoint + 10, canvas.shape[1], y_start, recent_loss_threshold)
 
-# In src/mot_dinov3/viz.py
-
-def _draw_reid_debug_panel(canvas: np.ndarray, reid_debug_info: dict, y_start: int, panel_h: int, frame_idx: int):
-    """Draws the Re-ID candidate comparison panel, cycling through available tracks."""
-    cv2.rectangle(canvas, (0, y_start), (canvas.shape[1], y_start + panel_h), (20, 20, 20), -1)
-    _draw_label(canvas, "Re-ID Candidate Matching", (10, y_start + 25), (150, 150, 150), font_scale=0.6)
-
-    if not reid_debug_info: return
-
-    # --- MODIFIED: Cycle through all available lost tracks using the frame index ---
-    lost_tids = sorted(list(reid_debug_info.keys()))
-    if not lost_tids: return
-
-    # Pick a track to focus on for this frame
-    focus_idx = frame_idx % len(lost_tids)
-    query_tid = lost_tids[focus_idx]
-    info = reid_debug_info[query_tid]
-    
-    thumb_w, thumb_h = DEBUG_THUMBNAIL_SIZE
-    x_offset, y_pos = 10, y_start + 40
-    
-    if info['query_crop'] is not None:
-        query_thumb = _resize_crop(info['query_crop'], (thumb_w, thumb_h))
-        canvas[y_pos:y_pos + thumb_h, x_offset:x_offset + thumb_w] = query_thumb
-        # Display which track is being focused on
-        _draw_label(canvas, f"Query ID {query_tid}", (x_offset, y_pos + thumb_h + 20), (255, 255, 0))
-    
-    x_offset += thumb_w + 20
-    cv2.line(canvas, (x_offset, y_pos), (x_offset, y_pos + thumb_h), (100, 100, 100), 2)
-    x_offset += 10
-
-    for cand in info['candidates']:
-        if x_offset + thumb_w > canvas.shape[1]: break
-        cand_thumb = _resize_crop(cand['crop'], (thumb_w, thumb_h))
-        canvas[y_pos:y_pos + thumb_h, x_offset:x_offset + thumb_w] = cand_thumb
-        score = cand['score']
-        color = (0, 255, 0) if score > 0.6 else (0, 215, 255)
-        _draw_label(canvas, f"Score: {score:.2f}", (x_offset, y_pos + thumb_h + 20), color)
-        x_offset += thumb_w + 10
-
 def draw_legend(frame: np.ndarray):
     """Draws a legend for track colors and shapes in the top-right corner."""
     legend_items = {
@@ -260,16 +220,81 @@ def draw_reid_links(frame: np.ndarray, reid_events: List[Dict], tracks: list, tr
         cv2.circle(frame, c_new, 6, reid_color, -1, cv2.LINE_AA)
         _draw_label(frame, f"Re-ID: {event['score']:.2f}", c_new, reid_color)
 
+def _draw_reid_debug_panel(canvas: np.ndarray, reid_debug_info: dict, reid_events: list, 
+                           y_start: int, panel_h: int):
+    """Draws a multi-row panel showing all Re-ID candidates and highlighting winners."""
+    
+    lost_tids = sorted(list(reid_debug_info.keys()))
+    num_lost = len(lost_tids)
+    
+    # Draw panel background and a dynamic title
+    cv2.rectangle(canvas, (0, y_start), (canvas.shape[1], y_start + panel_h), (20, 20, 20), -1)
+    title = f"Re-ID Candidate Matching ({num_lost} Track{'s' if num_lost != 1 else ''})"
+    _draw_label(canvas, title, (10, y_start + 25), (150, 150, 150), font_scale=0.6)
+
+    if not lost_tids: return
+
+    # Find the successful Re-ID matches for this frame to highlight them
+    successful_reids = {e['tid']: e['new_box'] for e in reid_events}
+
+    thumb_w, thumb_h = DEBUG_THUMBNAIL_SIZE
+    x_offset, y_offset = 10, y_start + 40
+    row_height = thumb_h + 40
+
+    for query_tid in lost_tids:
+        # If adding a new row would exceed the panel height, stop
+        if y_offset + row_height > y_start + panel_h:
+            break
+
+        info = reid_debug_info[query_tid]
+        
+        # Draw Query Thumbnail
+        if info['query_crop'] is not None:
+            query_thumb = _resize_crop(info['query_crop'], (thumb_w, thumb_h))
+            canvas[y_offset:y_offset + thumb_h, x_offset:x_offset + thumb_w] = query_thumb
+            _draw_label(canvas, f"Query ID {query_tid}", (x_offset, y_offset + thumb_h + 20), (255, 255, 0))
+        
+        cand_x = x_offset + thumb_w + 20
+        cv2.line(canvas, (cand_x - 10, y_offset), (cand_x - 10, y_offset + thumb_h), (100, 100, 100), 1)
+
+        # Draw Candidate Thumbnails for this query
+        for cand in info['candidates']:
+            if cand_x + thumb_w > canvas.shape[1]: break
+            
+            cand_thumb = _resize_crop(cand['crop'], (thumb_w, thumb_h))
+            canvas[y_offset:y_offset + thumb_h, cand_x:cand_x + thumb_w] = cand_thumb
+            score = cand['score']
+            
+            # Check if this candidate was the winner
+            is_winner = False
+            if query_tid in successful_reids:
+                # Compare bounding boxes to see if this is the matched one
+                if np.array_equal(cand['box'], successful_reids[query_tid]):
+                    is_winner = True
+            
+            label_color = (0, 255, 0) if is_winner else (0, 215, 255)
+            _draw_label(canvas, f"Score: {score:.2f}", (cand_x, y_offset + thumb_h + 20), label_color)
+
+            # Add a green border for the winning candidate
+            if is_winner:
+                cv2.rectangle(canvas, (cand_x, y_offset), (cand_x + thumb_w, y_offset + thumb_h), (0, 255, 0), 2)
+            
+            cand_x += thumb_w + 10
+            
+        # Move to the next row
+        y_offset += row_height
 
 def create_enhanced_frame(frame: np.ndarray, tracks: list, reid_events: List[Dict],
-                        reid_debug_info: dict, tracker_config: dict, hud_stats: dict,
-                        frame_idx: int) -> np.ndarray: 
+                          reid_debug_info: dict, tracker_config: dict, hud_stats: dict,
+                          frame_idx: int) -> np.ndarray:
     """Creates a single large frame with the main view and debug panels."""
     frame_h, frame_w = frame.shape[:2]
-    panel_h = DEBUG_PANEL_HEIGHT
+    # Adjust panel height if needed to accommodate more rows
+    panel_h = DEBUG_PANEL_HEIGHT 
+    
     canvas = np.zeros((frame_h + panel_h * 2, frame_w, 3), dtype=np.uint8)
     canvas[:frame_h, :, :] = frame
-
+    
     draw_tracks(canvas, tracks, tracker_config)
     draw_reid_links(canvas, reid_events, tracks, tracker_config)
 
@@ -277,9 +302,9 @@ def create_enhanced_frame(frame: np.ndarray, tracks: list, reid_events: List[Dic
     _draw_all_lost_tracks_panel(canvas, tracks, lost_panel_y_start, panel_h, tracker_config)
 
     reid_panel_y_start = frame_h + panel_h
-    # --- MODIFIED: Pass frame_idx to the debug panel ---
-    _draw_reid_debug_panel(canvas, reid_debug_info, reid_panel_y_start, panel_h, frame_idx)
-
+    # --- MODIFIED: Pass reid_events to the debug panel to identify winners ---
+    _draw_reid_debug_panel(canvas, reid_debug_info, reid_events, reid_panel_y_start, panel_h)
+    
     draw_legend(canvas)
     if hud_stats:
         draw_hud(canvas, hud_stats)
