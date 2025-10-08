@@ -30,12 +30,13 @@ def _state_to_color(track, recent_loss_threshold: int) -> Tuple[int, int, int]:
 
 def _draw_arrow(canvas: np.ndarray, pt1: Tuple[int, int], pt2: Tuple[int, int], color: Tuple[int, int, int], 
                 thickness: int = 2, absolute_tip_pixels: int = ARROW_TIP_PIXELS):
-    """Draws an arrow with a clamped, constant pixel-sized arrowhead."""
+    """Draws an arrow with a constant pixel-sized arrowhead."""
     arrow_length = np.linalg.norm(np.array(pt2) - np.array(pt1))
     if arrow_length <= 0: return
     
-    # Clamp relative tip length to a reasonable range (max 30%) to look better on short arrows
-    relative_tip_length = min(0.3, max(0.05, absolute_tip_pixels / arrow_length))
+    # Use a direct calculation to convert absolute pixel size to a relative factor
+    relative_tip_length = absolute_tip_pixels / arrow_length
+    
     cv2.arrowedLine(canvas, pt1, pt2, color, thickness, 
                     line_type=cv2.LINE_AA, tipLength=relative_tip_length)
 
@@ -69,9 +70,8 @@ def _resize_crop(crop: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
 
 # ---------- Panel and Legend Drawing Functions ----------
 
-def _draw_track_list_in_panel(canvas: np.ndarray, tracks_to_draw: list, title: str,
-                              x_start: int, x_end: int, y_start: int,
-                              recent_loss_threshold: int):
+def _draw_track_list_in_panel(canvas: np.ndarray, arrow_overlay: np.ndarray, tracks_to_draw: list, title: str,
+                              x_start: int, x_end: int, y_start: int, recent_loss_threshold: int):
     """A generic helper to draw a titled list of track thumbnails in a panel section."""
     _draw_label(canvas, title, (x_start, y_start + 25), (150, 150, 150), font_scale=0.6)
     
@@ -100,9 +100,7 @@ def _draw_track_list_in_panel(canvas: np.ndarray, tracks_to_draw: list, title: s
         arrow_start_pt = (x_offset + thumb_w // 2, y_pos + thumb_h // 2)
         arrow_end_pt = tuple(utils.centers_xyxy(t.box[np.newaxis, :])[0].astype(int))
         
-        # Use a dimmed color for arrows to make them less visually dominant
-        dim_color = tuple(c // 2 for c in color)
-        _draw_arrow(canvas, arrow_start_pt, arrow_end_pt, dim_color, absolute_tip_pixels=ARROW_TIP_PIXELS)
+        _draw_arrow(arrow_overlay, arrow_start_pt, arrow_end_pt, color, absolute_tip_pixels=ARROW_TIP_PIXELS)
         
         x_offset += thumb_w + 10
 
@@ -119,10 +117,17 @@ def _draw_all_lost_tracks_panel(canvas: np.ndarray, tracks: list, y_start: int, 
     panel_midpoint = canvas.shape[1] // 2
     cv2.line(canvas, (panel_midpoint, y_start), (panel_midpoint, y_start + panel_h), (80, 80, 80), 1)
 
-    _draw_track_list_in_panel(canvas, recent_lost, "Recently Lost (Gated Search)",
+    # Create an overlay for drawing semi-transparent arrows
+    arrow_overlay = np.zeros_like(canvas)
+
+    _draw_track_list_in_panel(canvas, arrow_overlay, recent_lost, "Recently Lost (Gated Search)",
                               10, panel_midpoint, y_start, recent_loss_threshold)
-    _draw_track_list_in_panel(canvas, long_term_lost, "Long-Term Lost (Global Search)",
+    _draw_track_list_in_panel(canvas, arrow_overlay, long_term_lost, "Long-Term Lost (Global Search)",
                               panel_midpoint + 10, canvas.shape[1], y_start, recent_loss_threshold)
+    
+    # Blend the arrow overlay onto the main canvas
+    alpha = 0.6  # 60% opacity for the arrows
+    cv2.addWeighted(arrow_overlay, alpha, canvas, 1.0, 0, canvas)
 
 def _draw_reid_debug_panel(canvas: np.ndarray, reid_debug_info: dict, y_start: int, panel_h: int):
     """Draws the Re-ID candidate comparison panel."""
