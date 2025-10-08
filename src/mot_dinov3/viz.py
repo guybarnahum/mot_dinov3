@@ -220,9 +220,11 @@ def draw_reid_links(frame: np.ndarray, reid_events: List[Dict], tracks: list, tr
         cv2.circle(frame, c_new, 6, reid_color, -1, cv2.LINE_AA)
         _draw_label(frame, f"Re-ID: {event['score']:.2f}", c_new, reid_color)
 
+# In src/mot_dinov3/viz.py
+
 def _draw_reid_debug_panel(canvas: np.ndarray, reid_debug_info: dict, reid_events: list, 
                            y_start: int, panel_h: int, frame_idx: int):
-    """Draws a multi-row panel showing a rotating selection of Re-ID candidates."""
+    """Draws a single horizontal row of Re-ID candidates, cycling through available tracks."""
     
     lost_tids = sorted(list(reid_debug_info.keys()))
     num_lost = len(lost_tids)
@@ -233,38 +235,42 @@ def _draw_reid_debug_panel(canvas: np.ndarray, reid_debug_info: dict, reid_event
 
     if not lost_tids: return
 
-    max_queries_to_show = 3
+    # Determine which track to start the horizontal scroll from
+    max_queries_to_show = 10 # Allow many queries, they will be clipped by screen width
     start_idx = (frame_idx // 5) % num_lost
     tids_to_show = [lost_tids[(start_idx + i) % num_lost] for i in range(min(max_queries_to_show, num_lost))]
     
-    _draw_label(canvas, f"(Showing {len(tids_to_show)} of {num_lost})", (270, y_start + 25), (150, 150, 150), font_scale=0.6)
+    _draw_label(canvas, f"(Showing from {start_idx + 1} of {num_lost})", (270, y_start + 25), (150, 150, 150), font_scale=0.6)
 
     successful_reids = {e['tid']: e['new_box'] for e in reid_events}
     thumb_w, thumb_h = DEBUG_THUMBNAIL_SIZE
     
-    # --- MODIFIED: More compact vertical layout to fit multiple rows ---
     x_offset = 10
-    y_offset = y_start + 30  # Reduced top padding
-    row_height = thumb_h + 30  # Reduced padding between rows
+    y_pos = y_start + 40 # Y position is now constant for the whole row
+    separator_width = 20
 
-    for query_tid in tids_to_show:
-        if y_offset + row_height > y_start + panel_h: break
-
+    for i, query_tid in enumerate(tids_to_show):
+        # Stop if the next query thumbnail won't fit on screen
+        if x_offset + thumb_w > canvas.shape[1]:
+            break
+        
         info = reid_debug_info[query_tid]
         
+        # Draw Query Thumbnail
         if info['query_crop'] is not None:
             query_thumb = _resize_crop(info['query_crop'], (thumb_w, thumb_h))
-            canvas[y_offset:y_offset + thumb_h, x_offset:x_offset + thumb_w] = query_thumb
-            _draw_label(canvas, f"Query ID {query_tid}", (x_offset, y_offset + thumb_h + 20), (255, 255, 0))
+            canvas[y_pos:y_pos + thumb_h, x_offset:x_offset + thumb_w] = query_thumb
+            _draw_label(canvas, f"Query ID {query_tid}", (x_offset, y_pos + thumb_h + 20), (255, 255, 0))
         
-        cand_x = x_offset + thumb_w + 20
-        cv2.line(canvas, (cand_x - 10, y_offset), (cand_x - 10, y_offset + thumb_h), (100, 100, 100), 1)
+        x_offset += thumb_w + 10
 
+        # Draw Candidates horizontally for this query
         for cand in info['candidates']:
-            if cand_x + thumb_w > canvas.shape[1]: break
+            if x_offset + thumb_w > canvas.shape[1]:
+                break
             
             cand_thumb = _resize_crop(cand['crop'], (thumb_w, thumb_h))
-            canvas[y_offset:y_offset + thumb_h, cand_x:cand_x + thumb_w] = cand_thumb
+            canvas[y_pos:y_pos + thumb_h, x_offset:x_offset + thumb_w] = cand_thumb
             score = cand['score']
             
             is_winner = False
@@ -272,14 +278,17 @@ def _draw_reid_debug_panel(canvas: np.ndarray, reid_debug_info: dict, reid_event
                 is_winner = True
             
             label_color = (0, 255, 0) if is_winner else (0, 215, 255)
-            _draw_label(canvas, f"Score: {score:.2f}", (cand_x, y_offset + thumb_h + 20), label_color)
+            _draw_label(canvas, f"Score: {score:.2f}", (x_offset, y_pos + thumb_h + 20), label_color)
 
             if is_winner:
-                cv2.rectangle(canvas, (cand_x, y_offset), (cand_x + thumb_w, y_offset + thumb_h), (0, 255, 0), 2)
+                cv2.rectangle(canvas, (x_offset, y_pos), (x_offset + thumb_w, y_pos + thumb_h), (0, 255, 0), 2)
             
-            cand_x += thumb_w + 10
-            
-        y_offset += row_height
+            x_offset += thumb_w + 10
+        
+        # Draw a separator before the next query group
+        if i < len(tids_to_show) - 1:
+            cv2.line(canvas, (x_offset, y_pos), (x_offset, y_pos + thumb_h), (80, 80, 80), 1)
+            x_offset += separator_width
 
 def create_enhanced_frame(frame: np.ndarray, tracks: list, reid_events: List[Dict],
                           reid_debug_info: dict, tracker_config: dict, hud_stats: dict,
