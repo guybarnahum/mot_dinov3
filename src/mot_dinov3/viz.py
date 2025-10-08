@@ -227,37 +227,31 @@ def _draw_reid_debug_panel(canvas: np.ndarray, reid_debug_info: dict, reid_event
     lost_tids = sorted(list(reid_debug_info.keys()))
     num_lost = len(lost_tids)
     
-    # Draw panel background and a dynamic title
     cv2.rectangle(canvas, (0, y_start), (canvas.shape[1], y_start + panel_h), (20, 20, 20), -1)
     title = f"Re-ID Candidates for Lost Tracks"
     _draw_label(canvas, title, (10, y_start + 25), (150, 150, 150), font_scale=0.6)
 
     if not lost_tids: return
 
-    # --- NEW: Logic to show a rotating subset of multiple tracks ---
-    max_queries_to_show = 3 # Show up to 3 lost tracks at a time
-    
-    # Rotate the selection every 5 frames for a smoother scroll
+    max_queries_to_show = 3
     start_idx = (frame_idx // 5) % num_lost
-    
-    # Get a "slice" of tracks to show, wrapping around the list if necessary
     tids_to_show = [lost_tids[(start_idx + i) % num_lost] for i in range(min(max_queries_to_show, num_lost))]
     
-    # Update title with a counter
     _draw_label(canvas, f"(Showing {len(tids_to_show)} of {num_lost})", (270, y_start + 25), (150, 150, 150), font_scale=0.6)
 
     successful_reids = {e['tid']: e['new_box'] for e in reid_events}
     thumb_w, thumb_h = DEBUG_THUMBNAIL_SIZE
-    x_offset, y_offset = 10, y_start + 40
-    row_height = thumb_h + 40
+    
+    # --- MODIFIED: More compact vertical layout to fit multiple rows ---
+    x_offset = 10
+    y_offset = y_start + 30  # Reduced top padding
+    row_height = thumb_h + 30  # Reduced padding between rows
 
-    # Loop through the subset of tracks selected for this frame
     for query_tid in tids_to_show:
         if y_offset + row_height > y_start + panel_h: break
 
         info = reid_debug_info[query_tid]
         
-        # Draw Query Thumbnail
         if info['query_crop'] is not None:
             query_thumb = _resize_crop(info['query_crop'], (thumb_w, thumb_h))
             canvas[y_offset:y_offset + thumb_h, x_offset:x_offset + thumb_w] = query_thumb
@@ -266,7 +260,6 @@ def _draw_reid_debug_panel(canvas: np.ndarray, reid_debug_info: dict, reid_event
         cand_x = x_offset + thumb_w + 20
         cv2.line(canvas, (cand_x - 10, y_offset), (cand_x - 10, y_offset + thumb_h), (100, 100, 100), 1)
 
-        # Draw Candidate Thumbnails for this query
         for cand in info['candidates']:
             if cand_x + thumb_w > canvas.shape[1]: break
             
