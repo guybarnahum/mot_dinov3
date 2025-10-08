@@ -18,7 +18,7 @@ ARROW_TIP_PIXELS = 10
 from typing import Tuple
 
 # Named Color Constants (BGR format)
-COLOR_DYNAMIC_ACTIVE = (0, 200, 50)    # Green
+COLOR_DYNAMIC_ACTIVE = (180, 70, 0)    # Dark blue
 COLOR_STATIC_ACTIVE  = (200, 120, 0)   # Blue
 COLOR_RECENT_LOST    = (0, 165, 255)   # Orange
 COLOR_LONG_TERM_LOST = (0, 0, 220)     # Red
@@ -285,7 +285,7 @@ def _draw_reid_debug_panel(canvas: np.ndarray, reid_debug_info: dict, reid_event
             # --- MODIFIED: Change separator color to bright white ---
             cv2.line(canvas, (x_offset, y_pos), (x_offset, y_pos + thumb_h), (255, 255, 255), 1)
             x_offset += separator_width
-            
+
 def create_enhanced_frame(frame: np.ndarray, tracks: list, reid_events: List[Dict],
                           reid_debug_info: dict, tracker_config: dict, hud_stats: dict,
                           frame_idx: int) -> np.ndarray:

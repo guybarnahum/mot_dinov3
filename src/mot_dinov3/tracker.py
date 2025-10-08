@@ -69,11 +69,30 @@ class Track:
         self.center_history.append(self.center.astype(int))
 
         det_conf = float(np.clip(kwargs.get('det_conf', 1.0), 0.0, 1.0))
-        if det_conf >= kwargs.get('conf_min_update', 0.3):
-            beta = (1.0 - self.alpha) * (kwargs.get('conf_update_weight', 0.5) * det_conf + (1.0 - kwargs.get('conf_update_weight', 0.5)))
+        conf_min_update = kwargs.get('conf_min_update', 0.3)
+        
+        if det_conf >= conf_min_update:
+            # --- ENHANCED GALLERY LOGIC ---
+            # 1. Update the short-term EMA embedding
+            conf_update_weight = kwargs.get('conf_update_weight', 0.5)
+            beta = (1.0 - self.alpha) * (conf_update_weight * det_conf + (1.0 - conf_update_weight))
             x = (1.0 - beta) * self.emb + beta * emb
             self.emb = (x / (np.linalg.norm(x) + 1e-12)).astype(np.float32)
-            self.gallery.append(self.emb.copy())
+
+            # 2. Gate gallery updates by confidence and diversity
+            # Only consider high-confidence detections for the long-term gallery
+            if det_conf > kwargs.get('conf_high', 0.6):
+                # Check for diversity: only add if the new view is different enough
+                if len(self.gallery) == 0:
+                    self.gallery.append(self.emb.copy())
+                else:
+                    # Calculate similarity to existing gallery embeddings
+                    sims = np.array([g @ self.emb for g in self.gallery])
+                    # Only add if it's not too similar to any existing keyframe
+                    DIVERSITY_THRESHOLD = 0.90 
+                    if np.all(sims < DIVERSITY_THRESHOLD):
+                        self.gallery.append(self.emb.copy())
+            # --- END ENHANCED GALLERY LOGIC ---
             
             det_cls = kwargs.get('det_cls', None)
             if det_cls is not None and det_cls >= 0:
@@ -83,6 +102,23 @@ class Track:
         self.time_since_update = 0
         self.state = "active"
         self.last_conf = det_conf
+
+    def best_sim(self, emb: np.ndarray) -> float:
+        """Calculates the best similarity against the EMA and the entire gallery."""
+        # --- MODIFIED: Check against both the primary EMA and the gallery ---
+        # Normalize the incoming embedding once
+        e_norm = emb / (np.linalg.norm(emb) + 1e-12)
+        
+        # 1. Check against the primary (short-term) EMA embedding
+        best = float(self.emb @ e_norm)
+        
+        # 2. Check against the long-term gallery and take the max score
+        for g_emb in self.gallery:
+            sim = float(g_emb @ e_norm)
+            if sim > best:
+                best = sim
+                
+        return best
 
     def _update_class_hist(self, det_cls: int, det_conf: float, smoothing: float, decay: float):
         w = det_conf * smoothing
@@ -149,8 +185,8 @@ class SimpleTracker:
         self.tracks = [t for t in self.tracks if not (t.state == "lost" and t.time_since_update > self.reid_max_age)]
 
     def _associate(self, cost_matrix: np.ndarray, unmatched_dets: Set[int], unmatched_tracks: Set[int],
-                   act_idx: List[int], det_ids: List[int], boxes: np.ndarray, embs: np.ndarray,
-                   frame: np.ndarray, clses: Optional[np.ndarray], confs: Optional[np.ndarray], is_reid: bool = False):
+                act_idx: List[int], det_ids: List[int], boxes: np.ndarray, embs: np.ndarray,
+                frame: np.ndarray, clses: Optional[np.ndarray], confs: Optional[np.ndarray], is_reid: bool = False):
         if not act_idx or not det_ids: return
         
         if self.use_hungarian: rows, cols = linear_sum_assignment(cost_matrix)
@@ -166,13 +202,15 @@ class SimpleTracker:
             track = self.tracks[ti]
 
             if is_reid:
-                event = {"tid": track.tid, "old_box": track.box.copy(), "new_box": boxes[j], "score": 1.0 - cost_matrix[r,c]}
+                # --- MODIFIED: Use the more robust best_sim() method for the final score ---
+                event = {"tid": track.tid, "old_box": track.box.copy(), "new_box": boxes[j], "score": track.best_sim(embs[j])}
                 self.reid_events_this_frame.append(event)
             
+            # ... (rest of the function is the same)
             track.update(boxes[j], embs[j], det_conf=(confs[j] if confs is not None else 1.0), 
-                         det_cls=(int(clses[j]) if clses is not None else None),
-                         conf_min_update=self.conf_min_update, conf_update_weight=self.conf_update_weight,
-                         class_vote_smoothing=self.class_vote_smoothing, class_decay_factor=self.class_decay_factor)
+                        det_cls=(int(clses[j]) if clses is not None else None),
+                        conf_min_update=self.conf_min_update, conf_update_weight=self.conf_update_weight,
+                        class_vote_smoothing=self.class_vote_smoothing, class_decay_factor=self.class_decay_factor)
             track.last_known_crop = utils.get_crop(frame, boxes[j])
             
             unmatched_dets.discard(j)
