@@ -34,8 +34,8 @@ def _draw_arrow(canvas: np.ndarray, pt1: Tuple[int, int], pt2: Tuple[int, int], 
     arrow_length = np.linalg.norm(np.array(pt2) - np.array(pt1))
     if arrow_length <= 0: return
     
-    # Clamp relative tip length to a reasonable range to avoid visual artifacts
-    relative_tip_length = min(0.5, max(0.05, absolute_tip_pixels / arrow_length))
+    # Clamp relative tip length to a reasonable range (max 30%) to look better on short arrows
+    relative_tip_length = min(0.3, max(0.05, absolute_tip_pixels / arrow_length))
     cv2.arrowedLine(canvas, pt1, pt2, color, thickness, 
                     line_type=cv2.LINE_AA, tipLength=relative_tip_length)
 
@@ -48,7 +48,6 @@ def _draw_label(img: np.ndarray, text: str, pos: Tuple[int, int], color: Tuple[i
     x, y = pos
     pad = 3
     
-    # Safety guards to prevent drawing labels off-screen
     safe_y = max(th + pad * 2, y)
     safe_x = min(max(0, x), img.shape[1] - (tw + 2 * pad))
     
@@ -89,16 +88,21 @@ def _draw_track_list_in_panel(canvas: np.ndarray, tracks_to_draw: list, title: s
         
         color = _state_to_color(t, recent_loss_threshold)
         
-        label = f"ID {t.tid} ({t.time_since_update}f)"
+        # Draw ID and Velocity on separate lines for clarity
+        id_label = f"ID {t.tid} ({t.time_since_update}f)"
+        _draw_label(canvas, id_label, (x_offset, y_pos + thumb_h + 20), color)
+        
         if t.time_since_update <= recent_loss_threshold:
             vx, vy = t.velocity
-            label += f" v=[{vx:.1f},{vy:.1f}]"
-        
-        _draw_label(canvas, label, (x_offset, y_pos + thumb_h + 20), color)
+            v_label = f"v=[{vx:.1f},{vy:.1f}]"
+            _draw_label(canvas, v_label, (x_offset, y_pos + thumb_h + 38), color, font_scale=0.4)
         
         arrow_start_pt = (x_offset + thumb_w // 2, y_pos + thumb_h // 2)
         arrow_end_pt = tuple(utils.centers_xyxy(t.box[np.newaxis, :])[0].astype(int))
-        _draw_arrow(canvas, arrow_start_pt, arrow_end_pt, color, absolute_tip_pixels=ARROW_TIP_PIXELS)
+        
+        # Use a dimmed color for arrows to make them less visually dominant
+        dim_color = tuple(c // 2 for c in color)
+        _draw_arrow(canvas, arrow_start_pt, arrow_end_pt, dim_color, absolute_tip_pixels=ARROW_TIP_PIXELS)
         
         x_offset += thumb_w + 10
 
@@ -155,7 +159,7 @@ def draw_legend(frame: np.ndarray):
         "Dynamic": (0, 200, 50),
         "Static": (200, 120, 0),
         "Recent Loss": (0, 165, 255),
-        "Search Area": (0, 255, 255)  # Yellow to match debug visuals
+        "Search Area": (0, 255, 255)
     }
     x, y, line_h, pad = frame.shape[1] - 180, 20, 22, 5
     
