@@ -1,4 +1,4 @@
-# src/mot_dinov3/tracker.py (Final Polished Version)
+# src/mot_dinov3/tracker.py (Final Patched Version)
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -37,9 +37,15 @@ class KalmanFilter:
     def update(self, z: np.ndarray):
         y = z - self.H @ self.x
         S = self.H @ self.P @ self.H.T + self.R
-        K = np.linalg.solve(S.T, (self.H @ self.P).T).T
+        
+        # --- CORRECTED: Use the correct matrix dimensions for np.linalg.solve ---
+        # We solve S.T @ K.T = H @ P, then transpose the result K.T to get K.
+        K_T = np.linalg.solve(S.T, self.H @ self.P)
+        K = K_T.T
+        
         self.x = self.x + K @ y
         I = np.eye(4)
+        # Joseph form for numerical stability
         self.P = (I - K @ self.H) @ self.P @ (I - K @ self.H).T + K @ self.R @ K.T
 
 @dataclass(slots=True)
@@ -183,7 +189,6 @@ class SimpleTracker:
 
     def update(self, det_boxes: np.ndarray, det_embs: np.ndarray, frame: np.ndarray,
                confs: Optional[np.ndarray] = None, clses: Optional[np.ndarray] = None) -> Tuple[List[Track], List[Dict], Dict]:
-        # --- CORRECTED: Use a multi-line loop to correctly update all tracks ---
         for t in self.tracks:
             t.kf.predict()
             t.age += 1
