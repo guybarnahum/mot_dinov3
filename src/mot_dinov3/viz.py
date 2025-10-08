@@ -293,9 +293,7 @@ def create_enhanced_frame(frame: np.ndarray, tracks: list, reid_events: List[Dic
                           frame_idx: int) -> np.ndarray:
     """Creates a single large frame with the main view and debug panels."""
     frame_h, frame_w = frame.shape[:2]
-    # Adjust panel height if needed to accommodate more rows
-    panel_h = DEBUG_PANEL_HEIGHT 
-    
+    panel_h = DEBUG_PANEL_HEIGHT
     canvas = np.zeros((frame_h + panel_h * 2, frame_w, 3), dtype=np.uint8)
     canvas[:frame_h, :, :] = frame
     
@@ -306,8 +304,8 @@ def create_enhanced_frame(frame: np.ndarray, tracks: list, reid_events: List[Dic
     _draw_all_lost_tracks_panel(canvas, tracks, lost_panel_y_start, panel_h, tracker_config)
 
     reid_panel_y_start = frame_h + panel_h
-    # --- MODIFIED: Pass reid_events to the debug panel to identify winners ---
-    _draw_reid_debug_panel(canvas, reid_debug_info, reid_events, reid_panel_y_start, panel_h)
+    
+    _draw_reid_debug_panel(canvas, reid_debug_info, reid_events, reid_panel_y_start, panel_h, frame_idx)
     
     draw_legend(canvas)
     if hud_stats:
