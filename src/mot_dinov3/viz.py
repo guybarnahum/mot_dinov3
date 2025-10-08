@@ -235,28 +235,26 @@ def _draw_reid_debug_panel(canvas: np.ndarray, reid_debug_info: dict, reid_event
 
     if not lost_tids: return
 
-    # Determine which track to start the horizontal scroll from
-    max_queries_to_show = 10 # Allow many queries, they will be clipped by screen width
+    max_queries_to_show = 10
     start_idx = (frame_idx // 5) % num_lost
     tids_to_show = [lost_tids[(start_idx + i) % num_lost] for i in range(min(max_queries_to_show, num_lost))]
     
-    _draw_label(canvas, f"(Showing from {start_idx + 1} of {num_lost})", (270, y_start + 25), (150, 150, 150), font_scale=0.6)
+    # --- MODIFIED: Update the counter label to show "X of Y" ---
+    label_text = f"(Showing {len(tids_to_show)} of {num_lost})"
+    _draw_label(canvas, label_text, (270, y_start + 25), (150, 150, 150), font_scale=0.6)
 
     successful_reids = {e['tid']: e['new_box'] for e in reid_events}
     thumb_w, thumb_h = DEBUG_THUMBNAIL_SIZE
     
     x_offset = 10
-    y_pos = y_start + 40 # Y position is now constant for the whole row
+    y_pos = y_start + 40
     separator_width = 20
 
     for i, query_tid in enumerate(tids_to_show):
-        # Stop if the next query thumbnail won't fit on screen
-        if x_offset + thumb_w > canvas.shape[1]:
-            break
+        if x_offset + thumb_w > canvas.shape[1]: break
         
         info = reid_debug_info[query_tid]
         
-        # Draw Query Thumbnail
         if info['query_crop'] is not None:
             query_thumb = _resize_crop(info['query_crop'], (thumb_w, thumb_h))
             canvas[y_pos:y_pos + thumb_h, x_offset:x_offset + thumb_w] = query_thumb
@@ -264,10 +262,8 @@ def _draw_reid_debug_panel(canvas: np.ndarray, reid_debug_info: dict, reid_event
         
         x_offset += thumb_w + 10
 
-        # Draw Candidates horizontally for this query
         for cand in info['candidates']:
-            if x_offset + thumb_w > canvas.shape[1]:
-                break
+            if x_offset + thumb_w > canvas.shape[1]: break
             
             cand_thumb = _resize_crop(cand['crop'], (thumb_w, thumb_h))
             canvas[y_pos:y_pos + thumb_h, x_offset:x_offset + thumb_w] = cand_thumb
@@ -285,11 +281,11 @@ def _draw_reid_debug_panel(canvas: np.ndarray, reid_debug_info: dict, reid_event
             
             x_offset += thumb_w + 10
         
-        # Draw a separator before the next query group
         if i < len(tids_to_show) - 1:
-            cv2.line(canvas, (x_offset, y_pos), (x_offset, y_pos + thumb_h), (80, 80, 80), 1)
+            # --- MODIFIED: Change separator color to bright white ---
+            cv2.line(canvas, (x_offset, y_pos), (x_offset, y_pos + thumb_h), (255, 255, 255), 1)
             x_offset += separator_width
-
+            
 def create_enhanced_frame(frame: np.ndarray, tracks: list, reid_events: List[Dict],
                           reid_debug_info: dict, tracker_config: dict, hud_stats: dict,
                           frame_idx: int) -> np.ndarray:
