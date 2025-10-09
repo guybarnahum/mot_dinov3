@@ -6,6 +6,8 @@ This project's goal is to perform multi-object tracking by combining object dete
 
 To manage computational load, a budget-aware scheduler selectively computes new appearance embeddings based on track stability and a configurable time budget.
 
+![Example of Frame Debug Annotation](examples/mot-screen.jpg "Frame Debug Annotation")
+
 -----
 
 ## ✨ Features
