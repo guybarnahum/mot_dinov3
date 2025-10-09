@@ -1,23 +1,24 @@
 # 🦖 MOT-DINOv3
 
-### High-Performance Multi-Object Tracking with a Budget-Aware Embedding Scheduler
+### Multi-Object Tracking with a Gated Appearance Model and Motion Prediction
 
-This project combines state-of-the-art **YOLO** object detection with powerful **DINOv2/v3** appearance embeddings to perform robust multi-object tracking.
+This project's goal is to perform multi-object tracking by combining object detection with appearance embeddings. It focuses on maintaining stable track identities through common challenges like partial occlusion. This is addressed with two primary mechanisms: a Kalman filter to predict object motion and a dual-model appearance gallery to store and reference multiple viewpoints of a tracked object.
 
-The core innovation is a **smart, budget-aware scheduler** that dramatically reduces computational load. It intelligently decides when to compute new embeddings versus reusing cached ones, allowing for real-time performance even in complex scenes and on resource-constrained hardware.
-
-*Example output showing tracked objects with stable IDs.*
+To manage computational load, a budget-aware scheduler selectively computes new appearance embeddings based on track stability and a configurable time budget.
 
 -----
 
 ## ✨ Features
 
-  - **Detector**: Ultralytics YOLO (configurable, e.g., YOLOv8, YOLO11).
-  - **Embedder**: DINOv3 (gated) or DINOv2 (open) via 🤗 Transformers. Easily extendable to other models (CLIP, ResNet, etc.).
-  - **Tracker**: A robust tracker using IoU and cosine similarity, with Hungarian or greedy assignment. It handles track lifecycle (Active, Lost) and uses a confidence-weighted EMA to maintain stable embeddings.
-  - **Smart Scheduler**: The key to performance. It minimizes expensive embedding computations by reusing features for stable tracks and only running the embedder when necessary, all while honoring a per-frame time budget.
-  - **Profiling**: Built-in `tqdm` progress bar and detailed end-of-run summary with per-stage latency breakdowns (p50/p95) and effective FPS.
-  - **Simple Setup**: A shell script to configure the environment for either CPU or GPU (T4/L4).
+- **Detector**: Ultralytics YOLO (configurable via command line and config.toml).
+- **Embedder**: DINOv3 (gated) or DINOv2 (open) via 🤗 Transformers.
+- **Tracker**: A tracker designed for persistence through occlusions, featuring:
+  - **Kalman Filter Motion Model**: Uses a linear Kalman filter to predict track locations and smooth velocity estimates, improving matching with predicted boxes.
+  - **Gated Appearance Gallery**: Maintains a long-term gallery of high-quality, diverse embeddings for each track. This provides a robust reference for re-identification when a track's most recent appearance is corrupted by partial occlusion.
+  - **Velocity-Informed Gating**: Uses the track's last known velocity to define a dynamic search area for re-identification, making the search more efficient.
+
+- **Embedding Scheduler**: Selectively computes embeddings based on track stability, crowdedness, and a configurable time budget to reduce computational load. A force_compute_all flag is available to disable scheduling for baseline testing.
+- **Diagnostic Visualization**: An optional debug mode that generates a video with detailed diagnostic panels for analyzing tracker state and performance frame-by-frame.
 
 -----
 
