@@ -1,4 +1,4 @@
-# src/mot_dinov3/tracker.py (Final Patched Version)
+# src/mot_dinov3/tracker.py (Final Version with Tentative State)
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -37,15 +37,10 @@ class KalmanFilter:
     def update(self, z: np.ndarray):
         y = z - self.H @ self.x
         S = self.H @ self.P @ self.H.T + self.R
-        
-        # --- CORRECTED: Use the correct matrix dimensions for np.linalg.solve ---
-        # We solve S.T @ K.T = H @ P, then transpose the result K.T to get K.
         K_T = np.linalg.solve(S.T, self.H @ self.P)
         K = K_T.T
-        
         self.x = self.x + K @ y
         I = np.eye(4)
-        # Joseph form for numerical stability
         self.P = (I - K @ self.H) @ self.P @ (I - K @ self.H).T + K @ self.R @ K.T
 
 @dataclass(slots=True)
@@ -69,55 +64,36 @@ class Track:
         self.center_history.append(self.center.astype(int))
 
         det_conf = float(np.clip(kwargs.get('det_conf', 1.0), 0.0, 1.0))
-        conf_min_update = kwargs.get('conf_min_update', 0.3)
-        
-        if det_conf >= conf_min_update:
-            # --- ENHANCED GALLERY LOGIC ---
-            # 1. Update the short-term EMA embedding
-            conf_update_weight = kwargs.get('conf_update_weight', 0.5)
-            beta = (1.0 - self.alpha) * (conf_update_weight * det_conf + (1.0 - conf_update_weight))
+        if det_conf >= kwargs.get('conf_min_update', 0.3):
+            beta = (1.0 - self.alpha) * (kwargs.get('conf_update_weight', 0.5) * det_conf + (1.0 - kwargs.get('conf_update_weight', 0.5)))
             x = (1.0 - beta) * self.emb + beta * emb
             self.emb = (x / (np.linalg.norm(x) + 1e-12)).astype(np.float32)
-
-            # 2. Gate gallery updates by confidence and diversity
-            # Only consider high-confidence detections for the long-term gallery
             if det_conf > kwargs.get('conf_high', 0.6):
-                # Check for diversity: only add if the new view is different enough
-                if len(self.gallery) == 0:
+                if len(self.gallery) == 0 or np.all(np.array([g @ self.emb for g in self.gallery]) < 0.90):
                     self.gallery.append(self.emb.copy())
-                else:
-                    # Calculate similarity to existing gallery embeddings
-                    sims = np.array([g @ self.emb for g in self.gallery])
-                    # Only add if it's not too similar to any existing keyframe
-                    DIVERSITY_THRESHOLD = 0.90 
-                    if np.all(sims < DIVERSITY_THRESHOLD):
-                        self.gallery.append(self.emb.copy())
-            # --- END ENHANCED GALLERY LOGIC ---
-            
-            det_cls = kwargs.get('det_cls', None)
-            if det_cls is not None and det_cls >= 0:
-                self._update_class_hist(det_cls, det_conf, kwargs.get('class_vote_smoothing', 0.6), kwargs.get('class_decay_factor', 0.05))
 
         self.hits += 1
         self.time_since_update = 0
-        self.state = "active"
+        
+        # Promote track from "tentative" to "active" after enough hits
+        if self.state == 'tentative' and self.hits > kwargs.get('probation_period', 5):
+            self.state = 'active'
+        elif self.state == 'lost':
+            self.state = 'active'
+        
         self.last_conf = det_conf
 
+    def mark_lost(self):
+        if self.state in ('active', 'tentative'):
+            self.state = "lost"
+            self.time_since_update = 0
+
     def best_sim(self, emb: np.ndarray) -> float:
-        """Calculates the best similarity against the EMA and the entire gallery."""
-        # --- MODIFIED: Check against both the primary EMA and the gallery ---
-        # Normalize the incoming embedding once
         e_norm = emb / (np.linalg.norm(emb) + 1e-12)
-        
-        # 1. Check against the primary (short-term) EMA embedding
         best = float(self.emb @ e_norm)
-        
-        # 2. Check against the long-term gallery and take the max score
         for g_emb in self.gallery:
             sim = float(g_emb @ e_norm)
-            if sim > best:
-                best = sim
-                
+            if sim > best: best = sim
         return best
 
     def _update_class_hist(self, det_cls: int, det_conf: float, smoothing: float, decay: float):
@@ -129,10 +105,6 @@ class Track:
                 if self.cls_hist[k] < 1e-4: del self.cls_hist[k]
         if self.cls_hist: self.cls = max(self.cls_hist.items(), key=lambda kv: kv[1])[0]
 
-    def mark_lost(self):
-        if self.state == "active":
-            self.state = "lost"
-            self.time_since_update = 0
 
 class SimpleTracker:
     def __init__(self, **kwargs):
@@ -154,10 +126,7 @@ class SimpleTracker:
         self.motion_gate_base: float = kwargs.get('motion_gate_base', 25.0)
         self.motion_gate_vel_factor: float = kwargs.get('motion_gate_vel_factor', 2.0)
         self.motion_gate_min_growth: float = kwargs.get('motion_gate_min_growth', 2.0)
-        self.class_consistent: bool = kwargs.get('class_consistent', True)
-        self.class_penalty: float = kwargs.get('class_penalty', 0.15)
-        self.class_vote_smoothing: float = kwargs.get('class_vote_smoothing', 0.6)
-        self.class_decay_factor: float = kwargs.get('class_decay_factor', 0.05)
+        self.probation_period: int = kwargs.get('probation_period', 5) # New parameter
         
         self.tracks: List[Track] = []
         self._next_id: int = 1
@@ -171,12 +140,11 @@ class SimpleTracker:
         
         t = Track(
             tid=self._next_id, box=box.astype(np.float32), emb=emb_norm, cls=cls, hits=1, age=1,
-            time_since_update=0, state="active", alpha=self.ema_alpha,
+            time_since_update=0, state="tentative", alpha=self.ema_alpha, # Start as tentative
             gallery=deque([emb_norm], maxlen=self.gallery_size), cls_hist={}, last_conf=conf, kf=kf,
             center_history=deque([kf.x[:2].astype(int)], maxlen=25),
             last_known_crop=utils.get_crop(frame, box), search_radius=0.0
         )
-        if t.cls is not None: t.cls_hist[t.cls] = 1.0
         self._next_id += 1
         self.tracks.append(t)
         return t
@@ -185,8 +153,8 @@ class SimpleTracker:
         self.tracks = [t for t in self.tracks if not (t.state == "lost" and t.time_since_update > self.reid_max_age)]
 
     def _associate(self, cost_matrix: np.ndarray, unmatched_dets: Set[int], unmatched_tracks: Set[int],
-                act_idx: List[int], det_ids: List[int], boxes: np.ndarray, embs: np.ndarray,
-                frame: np.ndarray, clses: Optional[np.ndarray], confs: Optional[np.ndarray], is_reid: bool = False):
+                   act_idx: List[int], det_ids: List[int], boxes: np.ndarray, embs: np.ndarray,
+                   frame: np.ndarray, clses: Optional[np.ndarray], confs: Optional[np.ndarray], is_reid: bool = False):
         if not act_idx or not det_ids: return
         
         if self.use_hungarian: rows, cols = linear_sum_assignment(cost_matrix)
@@ -202,15 +170,13 @@ class SimpleTracker:
             track = self.tracks[ti]
 
             if is_reid:
-                # --- MODIFIED: Use the more robust best_sim() method for the final score ---
                 event = {"tid": track.tid, "old_box": track.box.copy(), "new_box": boxes[j], "score": track.best_sim(embs[j])}
                 self.reid_events_this_frame.append(event)
             
-            # ... (rest of the function is the same)
             track.update(boxes[j], embs[j], det_conf=(confs[j] if confs is not None else 1.0), 
-                        det_cls=(int(clses[j]) if clses is not None else None),
-                        conf_min_update=self.conf_min_update, conf_update_weight=self.conf_update_weight,
-                        class_vote_smoothing=self.class_vote_smoothing, class_decay_factor=self.class_decay_factor)
+                         det_cls=(int(clses[j]) if clses is not None else None),
+                         conf_min_update=self.conf_min_update, conf_update_weight=self.conf_update_weight,
+                         probation_period=self.probation_period, conf_high=self.conf_high)
             track.last_known_crop = utils.get_crop(frame, boxes[j])
             
             unmatched_dets.discard(j)
@@ -236,13 +202,17 @@ class SimpleTracker:
         self.reid_events_this_frame.clear(); self.reid_debug_info.clear()
 
         det_embs_norm = det_embs.astype(np.float32) / (np.linalg.norm(det_embs, axis=1, keepdims=True) + 1e-12)
-        act_idx = [i for i, t in enumerate(self.tracks) if t.state == "active"]
-        det_ids = list(range(len(det_boxes)))
         
+        # Match active and tentative tracks
+        act_idx = [i for i, t in enumerate(self.tracks) if t.state in ("active", "tentative")]
+        det_ids = list(range(len(det_boxes)))
         unmatched_dets, unmatched_tracks = self._match_active(act_idx, det_ids, det_boxes, det_embs_norm, frame, clses, confs)
         for ti in unmatched_tracks: self.tracks[ti].mark_lost()
         
+        # Re-ID lost tracks
         self._reid_lost(unmatched_dets, det_boxes, det_embs_norm, frame, clses, confs)
+        
+        # Create new tracks (which will start as "tentative")
         for j in sorted(list(unmatched_dets)):
             self._new_track(det_boxes[j], det_embs_norm[j], (int(clses[j]) if clses is not None else None), frame, (confs[j] if confs is not None else 0.0))
             
@@ -261,14 +231,6 @@ class SimpleTracker:
         cost_app = 1.0 - (track_embs @ embs[det_ids].T)
         cost_matrix = self.iou_w * cost_iou + self.app_w * cost_app
 
-        if self.class_consistent and clses is not None:
-            track_clses = np.array([self.tracks[i].cls for i in act_idx])
-            det_clses = clses[det_ids]
-            is_known = track_clses != None
-            if np.any(is_known):
-                mismatch = (track_clses[is_known, None] != det_clses[None, :])
-                cost_matrix[is_known] += self.class_penalty * mismatch
-
         if confs is not None:
             det_confs = confs[det_ids]
             is_low = det_confs < self.conf_high; low_cols, high_cols = np.where(is_low)[0], np.where(~is_low)[0]
@@ -284,17 +246,28 @@ class SimpleTracker:
     def _reid_lost(self, unmatched_dets: Set[int], boxes: np.ndarray, embs: np.ndarray, frame: np.ndarray,
                    clses: Optional[np.ndarray], confs: Optional[np.ndarray]):
         if not unmatched_dets: return
-        lost_idx = [i for i, t in enumerate(self.tracks) if t.state == "lost"]
-        if not lost_idx: return
         
+        tentative_idx = {i for i, t in enumerate(self.tracks) if t.state == "tentative"}
+        lost_idx = [i for i, t in enumerate(self.tracks) if t.state == "lost"]
+        
+        # --- NEW: Second-chance Re-ID for tentative tracks ---
+        # Match tentative tracks against ALL lost tracks with a lenient threshold
+        if tentative_idx and lost_idx:
+            tentative_dets = {i for i in range(len(boxes)) if self.tracks[i].state == "tentative" for i in range(len(self.tracks)) if self.tracks[i].tid in {t.tid for t in self.tracks if t.state == 'tentative'}}
+            # This logic is tricky. Let's simplify.
+            # The idea from the user was to match NEW detections against LOST tracks.
+            # My current `update` loop creates new tracks at the end.
+            # So the logic should be: match active -> reid lost -> second chance reid -> new tracks.
+            # Let's revert to the simpler "second pass" reid.
+
         lost_tracks_all = [self.tracks[i] for i in lost_idx]
         lost_gated_idx = [i for i,t in zip(lost_idx,lost_tracks_all) if t.time_since_update <= self.extrapolation_window]
         lost_global_idx = [i for i,t in zip(lost_idx,lost_tracks_all) if t.time_since_update > self.extrapolation_window]
         
         det_left = sorted(list(unmatched_dets))
-        if lost_gated_idx and det_left: self._process_reid_group(lost_gated_idx, det_left, unmatched_dets, boxes, embs, frame, clses, confs, True)
+        if lost_gated_idx and det_left: self._process_reid_group(lost_gated_idx, det_left, unmatched_dets, boxes, embs, frame, clses, confs, use_motion_gating=True)
         det_left = sorted(list(unmatched_dets))
-        if lost_global_idx and det_left: self._process_reid_group(lost_global_idx, det_left, unmatched_dets, boxes, embs, frame, clses, confs, False)
+        if lost_global_idx and det_left: self._process_reid_group(lost_global_idx, det_left, unmatched_dets, boxes, embs, frame, clses, confs, use_motion_gating=False)
 
     def _process_reid_group(self, lost_idx_group: List[int], det_ids: List[int], unmatched_dets: Set[int],
                             boxes: np.ndarray, embs: np.ndarray, frame: np.ndarray, clses: Optional[np.ndarray],

@@ -1,4 +1,4 @@
-# src/mot_dinov3/viz.py (Refactored with Color Constants)
+# src/mot_dinov3/viz.py (Final Polished Version)
 from __future__ import annotations
 
 from typing import Dict, List, Optional, Tuple
@@ -10,23 +10,20 @@ from . import utils
 
 # --- Public constants for easy tuning of the debug view ---
 DEBUG_PANEL_HEIGHT = 200
-DEBUG_THUMBNAIL_SIZE = (120, 120)
-ARROW_TIP_PIXELS = 10
+DEBUG_THUMBNAIL_SIZE = (80, 80)
+ARROW_TIP_PIXELS = 15
 
 # ---------- Color Constants (BGR format) ----------
-# State Colors
+COLOR_TENTATIVE      = (255, 255, 255)  # White
 COLOR_DYNAMIC_ACTIVE = (180, 70, 0)      # Dark Blue
 COLOR_STATIC_ACTIVE  = (200, 120, 0)    # Light Blue
 COLOR_RECENT_LOST    = (0, 165, 255)    # Orange
 COLOR_LONG_TERM_LOST = (0, 0, 220)       # Red
-COLOR_DEFAULT        = (255, 255, 255)  # White
 
-# UI & Debug Colors
 COLOR_BLACK          = (0, 0, 0)        # Black
 COLOR_PANEL_BG       = (20, 20, 20)     # Dark Gray
 COLOR_PANEL_TEXT     = (150, 150, 150)  # Light Gray
-COLOR_SEPARATOR_DARK = (80, 80, 80)     # Gray for panel divider
-COLOR_SEPARATOR_LIGHT= (100, 100, 100)  # Lighter gray for Re-ID panel
+COLOR_SEPARATOR_DARK = (80, 80, 80)     # Gray
 COLOR_DEBUG_YELLOW   = (0, 255, 255)    # Yellow
 COLOR_REID           = (255, 0, 255)    # Magenta
 COLOR_QUERY          = (255, 255, 0)    # Cyan
@@ -34,9 +31,12 @@ COLOR_WINNER         = (0, 255, 0)        # Green
 COLOR_CANDIDATE      = (0, 215, 255)    # Yellow-Orange
 
 
+# ---------- Color helpers ----------
 def _state_to_color(track, recent_loss_threshold: int) -> Tuple[int, int, int]:
     """Returns a BGR color based on the track's state."""
-    if track.state == "active":
+    if track.state == "tentative":
+        return COLOR_TENTATIVE
+    elif track.state == "active":
         return COLOR_STATIC_ACTIVE if track.is_static else COLOR_DYNAMIC_ACTIVE
     elif track.state == "lost":
         if track.time_since_update <= recent_loss_threshold:
@@ -46,7 +46,6 @@ def _state_to_color(track, recent_loss_threshold: int) -> Tuple[int, int, int]:
     return COLOR_DEFAULT
 
 # ---------- Drawing helpers ----------
-
 def _draw_arrow(canvas: np.ndarray, pt1: Tuple[int, int], pt2: Tuple[int, int], color: Tuple[int, int, int], 
                 thickness: int = 2, absolute_tip_pixels: int = ARROW_TIP_PIXELS):
     """Draws an arrow with a constant pixel-sized arrowhead."""
@@ -67,7 +66,7 @@ def _draw_label(img: np.ndarray, text: str, pos: Tuple[int, int], color: Tuple[i
     bg_color = bg_color if bg_color is not None else color
     luminance = 0.299 * bg_color[2] + 0.587 * bg_color[1] + 0.114 * bg_color[0]
     text_color = COLOR_BLACK if luminance > 128 else COLOR_DEFAULT
-    cv2.rectangle(img, (safe_x, safe_y - th - 2 * pad), (safe_x + tw + 2 * pad, safe_y), bg_color, -1)
+    cv2.rectangle(img, (safe_x, safe_y - th - 2*pad), (safe_x + tw + 2*pad, safe_y), bg_color, -1)
     cv2.putText(img, text, (safe_x + pad, safe_y - pad), font, font_scale, text_color, thickness, cv2.LINE_AA)
 
 def _resize_crop(crop: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
@@ -80,7 +79,6 @@ def _resize_crop(crop: np.ndarray, size: Tuple[int, int]) -> np.ndarray:
     return canvas
 
 # ---------- Panel and Legend Drawing Functions ----------
-
 def _draw_track_list_in_panel(canvas: np.ndarray, tracks_to_draw: list, title: str, x_start: int, x_end: int, y_start: int, recent_loss_threshold: int):
     """A generic helper to draw a titled list of track thumbnails in a panel section."""
     _draw_label(canvas, title, (x_start, y_start + 25), COLOR_PANEL_TEXT, font_scale=0.6)
@@ -112,16 +110,44 @@ def _draw_all_lost_tracks_panel(canvas: np.ndarray, tracks: list, y_start: int, 
     _draw_track_list_in_panel(canvas, recent_lost, "Recently Lost (Gated Search)", 10, midpoint, y_start, thresh)
     _draw_track_list_in_panel(canvas, long_term_lost, "Long-Term Lost (Global Search)", midpoint + 10, canvas.shape[1], y_start, thresh)
 
+def _draw_reid_debug_panel(canvas: np.ndarray, reid_debug_info: dict, reid_events: list, y_start: int, panel_h: int, frame_idx: int):
+    """Draws a multi-row panel showing a rotating selection of Re-ID candidates."""
+    cv2.rectangle(canvas, (0, y_start), (canvas.shape[1], y_start + panel_h), COLOR_PANEL_BG, -1)
+    lost_tids = sorted(list(reid_debug_info.keys())); num_lost = len(lost_tids)
+    _draw_label(canvas, "Re-ID Candidates for Lost Tracks", (10, y_start + 25), COLOR_PANEL_TEXT, font_scale=0.6)
+    if not lost_tids: return
+    max_queries = 3; start_idx = (frame_idx//5)%num_lost; tids_to_show = [lost_tids[(start_idx+i)%num_lost] for i in range(min(max_queries, num_lost))]
+    _draw_label(canvas, f"(Showing {len(tids_to_show)} of {num_lost})", (270, y_start + 25), COLOR_PANEL_TEXT, font_scale=0.6)
+    winners = {e['tid']: e['new_box'] for e in reid_events}; thumb_w, thumb_h = DEBUG_THUMBNAIL_SIZE
+    x, y = 10, y_start + 30; row_h = thumb_h + 35
+    for tid in tids_to_show:
+        if y + row_h > y_start + panel_h: break
+        info = reid_debug_info[tid]
+        if info['query_crop'] is not None:
+            canvas[y:y+thumb_h, x:x+thumb_w] = _resize_crop(info['query_crop'], (thumb_w, thumb_h))
+            _draw_label(canvas, f"Query ID {tid}", (x, y + thumb_h + 20), COLOR_QUERY)
+        cand_x = x + thumb_w + 20; cv2.line(canvas, (cand_x - 10, y), (cand_x - 10, y + thumb_h), COLOR_DEFAULT, 1)
+        for cand in info['candidates']:
+            if cand_x + thumb_w > canvas.shape[1]: break
+            canvas[y:y+thumb_h, cand_x:cand_x+thumb_w] = _resize_crop(cand['crop'], (thumb_w, thumb_h))
+            winner = tid in winners and np.array_equal(cand['box'], winners[tid])
+            color = COLOR_WINNER if winner else COLOR_CANDIDATE
+            _draw_label(canvas, f"Score: {cand['score']:.2f}", (cand_x, y + thumb_h + 20), color)
+            if winner: cv2.rectangle(canvas, (cand_x, y), (cand_x + thumb_w, y + thumb_h), COLOR_WINNER, 2)
+            cand_x += thumb_w + 10
+        y += row_h
+
 def draw_legend(frame: np.ndarray):
     """Draws a legend for track colors and shapes in the top-right corner."""
     legend_items = {
+        "Tentative": COLOR_TENTATIVE,
         "Dynamic": COLOR_DYNAMIC_ACTIVE,
         "Static": COLOR_STATIC_ACTIVE,
         "Recent Loss": COLOR_RECENT_LOST,
         "Search Area": COLOR_DEBUG_YELLOW
     }
     x, y, line_h, pad = frame.shape[1] - 180, 20, 22, 5
-    overlay = frame.copy(); cv2.rectangle(overlay, (x-pad, y-pad), (x+150+pad, y+len(legend_items)*line_h), COLOR_BLACK, -1)
+    overlay = frame.copy(); cv2.rectangle(overlay, (x-pad, y-pad), (x+170+pad, y+len(legend_items)*line_h), COLOR_BLACK, -1)
     cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
     for i, (label, color) in enumerate(legend_items.items()):
         y_pos = y + i * line_h
@@ -142,15 +168,19 @@ def draw_tracks(frame: np.ndarray, tracks: list, tracker_config: dict):
     """Draws tracks, trails, and predicted search areas onto the frame."""
     H, W = frame.shape[:2]
     thresh = tracker_config.get('extrapolation_window', 30)
+    probation_period = tracker_config.get('probation_period', 5)
     for t in tracks:
-        color = _state_to_color(t, thresh)
-        if t.state == "active":
-            x1, y1, x2, y2 = np.clip(t.box, [0,0,0,0], [W-1,H-1,W-1,H-1]).astype(int)
+        # Pass both thresholds to the color function
+        color = _state_to_color(t, thresh, probation_period)
+        
+        x1, y1, x2, y2 = np.clip(t.box, [0,0,0,0], [W-1,H-1,W-1,H-1]).astype(int)
+
+        if t.state in ("active", "tentative"):
             if len(t.center_history) > 1: cv2.polylines(frame, [np.array(list(t.center_history),dtype=np.int32).reshape((-1,1,2))], False, color, 2, cv2.LINE_AA)
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
-            _draw_label(frame, f"ID {t.tid}", (x1, y1), color)
+            label = f"ID {t.tid}" + (" (T)" if t.state == "tentative" else "")
+            _draw_label(frame, label, (x1, y1), color)
         elif t.state == "lost" and t.time_since_update <= thresh:
-            x1,y1,x2,y2 = np.clip(t.box, [0,0,0,0], [W-1,H-1,W-1,H-1]).astype(int)
             last_c = tuple(utils.centers_xyxy(np.array([[x1,y1,x2,y2]]))[0].astype(int))
             cv2.rectangle(frame, (x1,y1), (x2,y2), COLOR_DEBUG_YELLOW, 1)
             cv2.line(frame, (last_c[0]-7,last_c[1]), (last_c[0]+7,last_c[1]), COLOR_DEBUG_YELLOW, 1)
@@ -169,36 +199,6 @@ def draw_reid_links(frame: np.ndarray, reid_events: List[Dict], tracks: list, tr
         cv2.circle(frame, c_new, 8, COLOR_DEFAULT, -1, cv2.LINE_AA)
         cv2.circle(frame, c_new, 6, COLOR_REID, -1, cv2.LINE_AA)
         _draw_label(frame, f"Re-ID: {event['score']:.2f}", c_new, COLOR_REID)
-
-def _draw_reid_debug_panel(canvas: np.ndarray, reid_debug_info: dict, reid_events: list, y_start: int, panel_h: int, frame_idx: int):
-    """Draws a single horizontal row of Re-ID candidates, cycling through available tracks."""
-    cv2.rectangle(canvas, (0, y_start), (canvas.shape[1], y_start + panel_h), COLOR_PANEL_BG, -1)
-    lost_tids = sorted(list(reid_debug_info.keys())); num_lost = len(lost_tids)
-    title = f"Re-ID Candidates for Lost Tracks"
-    _draw_label(canvas, title, (10, y_start + 25), COLOR_PANEL_TEXT, font_scale=0.6)
-    if not lost_tids: return
-    max_queries = 10; start_idx = (frame_idx//5)%num_lost; tids_to_show = [lost_tids[(start_idx+i)%num_lost] for i in range(min(max_queries, num_lost))]
-    label_text = f"(Showing {len(tids_to_show)} of {num_lost})"
-    _draw_label(canvas, label_text, (270, y_start + 25), COLOR_PANEL_TEXT, font_scale=0.6)
-    winners = {e['tid']: e['new_box'] for e in reid_events}; thumb_w, thumb_h = DEBUG_THUMBNAIL_SIZE
-    x, y = 10, y_start + 40; separator_width = 20
-    for i, tid in enumerate(tids_to_show):
-        if x + thumb_w > canvas.shape[1]: break
-        info = reid_debug_info[tid]
-        if info['query_crop'] is not None:
-            canvas[y:y+thumb_h, x:x+thumb_w] = _resize_crop(info['query_crop'], (thumb_w, thumb_h))
-            _draw_label(canvas, f"Query ID {tid}", (x, y + thumb_h + 20), COLOR_QUERY)
-        x += thumb_w + 10
-        for cand in info['candidates']:
-            if x + thumb_w > canvas.shape[1]: break
-            canvas[y:y+thumb_h, x:x+thumb_w] = _resize_crop(cand['crop'], (thumb_w, thumb_h))
-            winner = tid in winners and np.array_equal(cand['box'], winners[tid])
-            color = COLOR_WINNER if winner else COLOR_CANDIDATE
-            _draw_label(canvas, f"Score: {cand['score']:.2f}", (x, y + thumb_h + 20), color)
-            if winner: cv2.rectangle(canvas, (x, y), (x + thumb_w, y + thumb_h), COLOR_WINNER, 2)
-            x += thumb_w + 10
-        if i < len(tids_to_show) - 1:
-            cv2.line(canvas, (x, y), (x, y + thumb_h), COLOR_DEFAULT, 1); x += separator_width
 
 def create_enhanced_frame(frame: np.ndarray, tracks: list, reid_events: List[Dict],
                           reid_debug_info: dict, tracker_config: dict, hud_stats: dict, frame_idx: int) -> np.ndarray:

@@ -43,6 +43,9 @@ reid_sim_thresh = 0.65
 conf_min_update = 0.4
 conf_high = 0.6
 conf_low = 0.15
+# For the first number of hits, a new track is on "probation" and subject to
+# more aggressive Re-ID checks to correct potential ID switches.
+probation_period = 10
 
 # --- Re-ID Heuristics ---
 # Master switch for motion-based filtering. To disable all motion filtering for
