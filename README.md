@@ -76,7 +76,7 @@ python cli.py \
 
 -----
 
-## 🧠 The Smart Scheduler
+## 🧠 Embedding Scheduler
 
 The scheduler is the core component for achieving high performance. It categorizes every detection to decide if an expensive embedding calculation is truly necessary.
 
