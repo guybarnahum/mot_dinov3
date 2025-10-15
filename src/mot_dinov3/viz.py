@@ -32,8 +32,10 @@ COLOR_CANDIDATE      = (0, 215, 255)    # Yellow-Orange
 
 
 # ---------- Color helpers ----------
+
 def _state_to_color(track, recent_loss_threshold: int) -> Tuple[int, int, int]:
     """Returns a BGR color based on the track's state."""
+    # --- MODIFIED: Correctly check for the 'tentative' state first ---
     if track.state == "tentative":
         return COLOR_TENTATIVE
     elif track.state == "active":
@@ -167,27 +169,31 @@ def draw_hud(frame: np.ndarray, stats: Dict):
 def draw_tracks(frame: np.ndarray, tracks: list, tracker_config: dict):
     """Draws tracks, trails, and predicted search areas onto the frame."""
     H, W = frame.shape[:2]
-    thresh = tracker_config.get('extrapolation_window', 30)
-    probation_period = tracker_config.get('probation_period', 5)
+    recent_loss_threshold = tracker_config.get('extrapolation_window', 30)
+    
     for t in tracks:
-        # Pass both thresholds to the color function
-        color = _state_to_color(t, thresh, probation_period)
+        # --- CORRECTED: Call _state_to_color with only the two required arguments ---
+        color = _state_to_color(t, recent_loss_threshold)
         
         x1, y1, x2, y2 = np.clip(t.box, [0,0,0,0], [W-1,H-1,W-1,H-1]).astype(int)
 
         if t.state in ("active", "tentative"):
-            if len(t.center_history) > 1: cv2.polylines(frame, [np.array(list(t.center_history),dtype=np.int32).reshape((-1,1,2))], False, color, 2, cv2.LINE_AA)
+            if len(t.center_history) > 1:
+                cv2.polylines(frame, [np.array(list(t.center_history),dtype=np.int32).reshape((-1,1,2))], False, color, 2, cv2.LINE_AA)
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
             label = f"ID {t.tid}" + (" (T)" if t.state == "tentative" else "")
             _draw_label(frame, label, (x1, y1), color)
-        elif t.state == "lost" and t.time_since_update <= thresh:
+            
+        elif t.state == "lost" and t.time_since_update <= recent_loss_threshold:
             last_c = tuple(utils.centers_xyxy(np.array([[x1,y1,x2,y2]]))[0].astype(int))
             cv2.rectangle(frame, (x1,y1), (x2,y2), COLOR_DEBUG_YELLOW, 1)
             cv2.line(frame, (last_c[0]-7,last_c[1]), (last_c[0]+7,last_c[1]), COLOR_DEBUG_YELLOW, 1)
             cv2.line(frame, (last_c[0],last_c[1]-7), (last_c[0],last_c[1]+7), COLOR_DEBUG_YELLOW, 1)
-            pred_c = tuple(t.center.astype(int)); allowance = t.search_radius
+            pred_c = tuple(t.center.astype(int))
+            allowance = t.search_radius
             cv2.circle(frame, pred_c, max(1,int(allowance)), COLOR_DEBUG_YELLOW, 1, cv2.LINE_AA)
-            if t.time_since_update > 0: cv2.line(frame, last_c, pred_c, COLOR_DEBUG_YELLOW, 1, cv2.LINE_AA)
+            if t.time_since_update > 0:
+                cv2.line(frame, last_c, pred_c, COLOR_DEBUG_YELLOW, 1, cv2.LINE_AA)
 
 def draw_reid_links(frame: np.ndarray, reid_events: List[Dict], tracks: list, tracker_config: dict):
     """Draws visual links for Re-ID events with a distinct color."""
