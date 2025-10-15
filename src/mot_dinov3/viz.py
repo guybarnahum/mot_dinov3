@@ -30,6 +30,7 @@ COLOR_QUERY          = (255, 255, 0)    # Cyan
 COLOR_WINNER         = (0, 255, 0)        # Green
 COLOR_CANDIDATE      = (0, 215, 255)    # Yellow-Orange
 
+COLOR_DEFAULT        = COLOR_TENTATIVE
 
 # ---------- Color helpers ----------
 
