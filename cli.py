@@ -47,7 +47,7 @@ compat.apply(strict_numpy=False, quiet=True)
 from mot_dinov3.detector import Detector
 from mot_dinov3.embedders import GatedModelAccessError
 from mot_dinov3.features.factory import create_extractor
-from mot_dinov3.scheduler import EmbeddingScheduler
+from mot_dinov3.scheduler import EmbeddingScheduler, SchedulerConfig
 from mot_dinov3.tracker import SimpleTracker
 
 from mot_dinov3.viz import (
