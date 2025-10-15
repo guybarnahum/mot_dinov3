@@ -271,11 +271,21 @@ def setup_video_io(io_cfg: IOParams, viz_cfg: VizParams, meta: Dict[str, Any]) -
 def initialize_components(cfg: Config, device: str, keep_ids: Optional[List[int]]) -> Dict[str, object]:
     """Initializes all the main processing modules."""
     detector = Detector(cfg.detector.det, imgsz=cfg.detector.imgsz, classes_to_track=keep_ids)
-    
-    amp_dtype = ("bf16" if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8 else "fp16") if cfg.embedder.embed_amp == "auto" else (cfg.embedder.embed_amp if cfg.embedder.embed_amp != "off" else None)
-    embedder = create_extractor(cfg.embedder.embedder, cfg.embedder.embed_model, device, autocast=(device == "cuda"), amp_dtype=amp_dtype, pad=cfg.embedder.crop_pad, square=cfg.embedder.crop_square)
+    amp = "bf16" if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else "fp16"
+    amp_dtype = amp if cfg.embedder.embed_amp == "auto" else (cfg.embedder.embed_amp if cfg.embedder.embed_amp != "off" else None)
+    embedder = create_extractor(cfg.embedder.embedder, cfg.embedder.embed_model, device, autocast=(device=="cuda"), amp_dtype=amp_dtype, pad=cfg.embedder.crop_pad, square=cfg.embedder.crop_square)
     tracker = SimpleTracker(**asdict(cfg.tracker))
-    scheduler = EmbeddingScheduler(SchedulerConfig(**asdict(cfg.scheduler)))
+
+    scheduler_config = SchedulerConfig(
+        overlap_thr=cfg.scheduler.overlap_thr,
+        iou_gate=cfg.scheduler.iou_gate,
+        refresh_every=cfg.scheduler.refresh_every,
+        ema_alpha=cfg.scheduler.ema_alpha,
+        force_compute_all=cfg.scheduler.force_compute_all
+    )
+    
+    scheduler = EmbeddingScheduler(scheduler_config)
+    
     return {"detector": detector, "embedder": embedder, "tracker": tracker, "scheduler": scheduler}
 
 def run_processing_loop(cfg: Config, cap: cv2.VideoCapture, writer: cv2.VideoWriter,
