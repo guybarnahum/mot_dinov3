@@ -88,7 +88,7 @@ class SchedulerParams:
     refresh_every: int = 5
     ema_alpha: float = 0.35
     embed_budget_ms: float = 0.0
-    force_compute_all: bool = True
+    force_compute_all: bool = False # Changed from True to False for a sane default
 
 @dataclass
 class TrackerParams:
@@ -97,25 +97,23 @@ class TrackerParams:
     iou_thresh: float = 0.3
     iou_thresh_low: float = 0.2
     reid_sim_thresh: float = 0.6
-    max_age: int = 30
     reid_max_age: int = 60
+    probation_period: int = 5 # New
     ema_alpha: float = 0.9
     gallery_size: int = 10
     use_hungarian: bool = True
-    class_consistent: bool = True
-    class_penalty: float = 0.15
-    conf_high: float = 0.5
-    conf_low: float = 0.1
-    conf_min_update: float = 0.3
-    conf_update_weight: float = 0.5
-    low_conf_iou_only: bool = True
     motion_gate: bool = True
     extrapolation_window: int = 30
-    center_gate_base: float = 50.0
-    center_gate_slope: float = 10.0
+    motion_gate_base: float = 25.0
+    motion_gate_vel_factor: float = 2.0
+    motion_gate_min_growth: float = 2.0
+    conf_high: float = 0.5
+    conf_min_update: float = 0.3
+    conf_update_weight: float = 0.5
+    class_consistent: bool = True
+    class_penalty: float = 0.15
     class_vote_smoothing: float = 0.6
     class_decay_factor: float = 0.05
-    # --- NEW: Parameter for enabling debug info in the tracker ---
     reid_debug_k: int = 3
 
 @dataclass
@@ -270,22 +268,22 @@ def setup_video_io(io_cfg: IOParams, viz_cfg: VizParams, meta: Dict[str, Any]) -
     
     return cap, writer
     
-
-def initialize_components(cfg: Config, device: str) -> Dict[str, object]:
+def initialize_components(cfg: Config, device: str, keep_ids: Optional[List[int]]) -> Dict[str, object]:
     """Initializes all the main processing modules."""
-    detector = Detector(cfg.detector.det, imgsz=cfg.detector.imgsz)
+    detector = Detector(cfg.detector.det, imgsz=cfg.detector.imgsz, classes_to_track=keep_ids)
+    
     amp_dtype = ("bf16" if torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8 else "fp16") if cfg.embedder.embed_amp == "auto" else (cfg.embedder.embed_amp if cfg.embedder.embed_amp != "off" else None)
     embedder = create_extractor(cfg.embedder.embedder, cfg.embedder.embed_model, device, autocast=(device == "cuda"), amp_dtype=amp_dtype, pad=cfg.embedder.crop_pad, square=cfg.embedder.crop_square)
     tracker = SimpleTracker(**asdict(cfg.tracker))
-    scheduler = EmbeddingScheduler(cfg.scheduler)
+    scheduler = EmbeddingScheduler(SchedulerConfig(**asdict(cfg.scheduler)))
     return {"detector": detector, "embedder": embedder, "tracker": tracker, "scheduler": scheduler}
 
 def run_processing_loop(cfg: Config, cap: cv2.VideoCapture, writer: cv2.VideoWriter,
-                        components: Dict[str, object], frames_to_process: int, device: str) -> Stats:
+                        components: Dict[str, object], frames_to_process: int, device: str,
+                        keep_ids: Optional[List[int]]) -> Stats:
     """The main frame-by-frame processing loop."""
     stats = Stats()
     frame_idx, end_frame = cfg.io.start_frame, cfg.io.end_frame or float('inf')
-    keep_ids = set(int(x) for x in cfg.detector.classes.split(",") if x.strip().isdigit()) if cfg.detector.classes else None
     
     fps_tracker = deque(maxlen=30)
     prev_reuse_count, prev_real_count = 0, 0
@@ -302,10 +300,8 @@ def run_processing_loop(cfg: Config, cap: cv2.VideoCapture, writer: cv2.VideoWri
 
             viz_info = {} if cfg.viz.viz_reasons else None
 
-            t = perf_counter(); boxes, confs, clses = components["detector"].detect(frame, conf_thres=cfg.detector.conf); stats.stage_timers["detect"] += perf_counter() - t
-            if keep_ids and len(boxes) > 0:
-                mask = np.array([c in keep_ids for c in clses], dtype=bool)
-                boxes, confs, clses = boxes[mask], confs[mask], clses[mask]
+            t = perf_counter(); boxes, confs, clses = components["detector"].detect(frame, conf_thres=cfg.detector.conf, classes_to_track=keep_ids); 
+            stats.stage_timers["detect"] += perf_counter() - t
             
             embs, t_emb, _ = components["scheduler"].run(
                 frame=frame, boxes=boxes, embedder=components["embedder"], tracker=components["tracker"],
@@ -395,17 +391,19 @@ def main():
     hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_HUB_TOKEN")
     if hf_token: login(token=hf_token, add_to_git_credential=False); print("💡 Hugging Face token found and used for programmatic login.")
     
+    keep_ids = [int(x) for x in cfg.detector.classes.split(",") if x.strip().isdigit()] if cfg.detector.classes else None
+    
     video_meta, interrupted, components = {}, False, {}
     try:
-        # --- UPDATED: Pass visualization config to setup function ---
         cap, writer = setup_video_io(cfg.io, cfg.viz, video_meta)
         
         end_frame = cfg.io.end_frame if cfg.io.end_frame is not None else video_meta["total_frames"]
         frames_to_process = end_frame - cfg.io.start_frame
         if frames_to_process <= 0: raise ValueError("End frame must be greater than start frame.")
         
-        components, t_start = initialize_components(cfg, device), perf_counter()
-        stats = run_processing_loop(cfg, cap, writer, components, frames_to_process, device)
+        components, t_start = initialize_components(cfg, device, keep_ids), perf_counter()
+        
+        stats = run_processing_loop(cfg, cap, writer, components, frames_to_process, device, keep_ids)
         wall_time = perf_counter() - t_start
     except KeyboardInterrupt:
         interrupted = True
